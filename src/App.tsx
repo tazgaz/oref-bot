@@ -47,6 +47,12 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
+    document.title = 'התרעות פיקוד העורף בוט';
+    const iconEl = document.querySelector("link[rel='icon']") as HTMLLinkElement | null;
+    if (iconEl) {
+      iconEl.href = '/favicon-missile.svg?v=3';
+    }
+
     fetch('/api/settings')
       .then(res => res.json())
       .then(data => {
