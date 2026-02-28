@@ -1,0 +1,22 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: oref-app
+    ports:
+      - "3002:3000"
+    env_file:
+      - .env.local
+    environment:
+      - DB_PATH=/data/alerts.db
+      - WEBHOOK_LOG_PATH=/logs/webhook.log
+      - TZ=Asia/Jerusalem
+      - RUNNING_IN_CONTAINER=true
+    volumes:
+      - oref_data:/data
+      - ./logs:/logs
+    restart: unless-stopped
+
+volumes:
+  oref_data:
