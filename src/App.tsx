@@ -1,9 +1,42 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { Bell, Settings, ShieldAlert, CheckCircle, Trash2, Plus } from 'lucide-react';
+import { BarChart3, Bell, CheckCircle, Plus, Settings, ShieldAlert, Trash2 } from 'lucide-react';
 import { ISRAEL_CITIES } from './constants/cities';
 
 const socket = io();
+const ALERTS_PAGE_SIZE = 50;
+
+type TabKey = 'dashboard' | 'daily' | 'settings';
+
+type AlertItem = {
+  id?: number;
+  alert_id?: string;
+  timestamp: string;
+  data: {
+    id?: string;
+    cat?: string;
+    title?: string;
+    categoryName?: string;
+    data?: string[];
+    desc?: string;
+  };
+};
+
+type DailyCityItem = {
+  city: string;
+  alertsCount: number;
+  missileCount: number;
+};
+
+type DailySummaryItem = {
+  day: string;
+  alertsCount: number;
+  missileCount: number;
+  category?: string;
+  categoryName?: string;
+  mergeWindowMinutes?: number;
+  cities: DailyCityItem[];
+};
 
 function formatInIsraelTimezone(date: Date) {
   const parts = new Intl.DateTimeFormat('en-GB', {
@@ -22,8 +55,6 @@ function formatInIsraelTimezone(date: Date) {
 }
 
 function formatAlertTimestamp(value: string) {
-  // DB timestamps are saved as Israel local wall-time in "YYYY-MM-DD HH:mm:ss".
-  // Display them as-is (reordered) to avoid timezone double-conversion.
   const localDbMatch = value.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}:\d{2}:\d{2})$/);
   if (localDbMatch) {
     const [, year, month, day, time] = localDbMatch;
@@ -35,9 +66,30 @@ function formatAlertTimestamp(value: string) {
   return formatInIsraelTimezone(date);
 }
 
+function formatDayLabel(day: string) {
+  const m = day.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return day;
+  return `${m[3]}/${m[2]}/${m[1]}`;
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'settings'>('dashboard');
-  const [alerts, setAlerts] = useState<any[]>([]);
+  const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
+  const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [alertsCursor, setAlertsCursor] = useState<number | null>(null);
+  const [alertsHasMore, setAlertsHasMore] = useState(true);
+  const [alertsLoadingInitial, setAlertsLoadingInitial] = useState(false);
+  const [alertsLoadingMore, setAlertsLoadingMore] = useState(false);
+
+  const [dailySummary, setDailySummary] = useState<DailySummaryItem[]>([]);
+  const [dailyLoading, setDailyLoading] = useState(false);
+  const [dailyLoadedOnce, setDailyLoadedOnce] = useState(false);
+  const [selectedSummaryCity, setSelectedSummaryCity] = useState<string | null>(null);
+  const [selectedCityAlerts, setSelectedCityAlerts] = useState<AlertItem[]>([]);
+  const [selectedCityAlertsCursor, setSelectedCityAlertsCursor] = useState<number | null>(null);
+  const [selectedCityAlertsHasMore, setSelectedCityAlertsHasMore] = useState(false);
+  const [selectedCityAlertsLoading, setSelectedCityAlertsLoading] = useState(false);
+  const [selectedCityAlertsLoadingMore, setSelectedCityAlertsLoadingMore] = useState(false);
+
   const [cities, setCities] = useState<string[]>([]);
   const [webhookUrl, setWebhookUrl] = useState('');
   const [newCity, setNewCity] = useState('');
@@ -46,91 +98,223 @@ export default function App() {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+
+  const upsertAlerts = useCallback((incoming: AlertItem[], append: boolean) => {
+    setAlerts((prev) => {
+      const base = append ? [...prev] : [];
+      const seen = new Set(base.map((a) => a.alert_id || String(a.id || '')));
+      for (const item of incoming) {
+        const key = item.alert_id || String(item.id || '');
+        if (seen.has(key)) continue;
+        base.push(item);
+        seen.add(key);
+      }
+      return base;
+    });
+  }, []);
+
+  const fetchAlertsPage = useCallback(async (cursor: number | null, append: boolean) => {
+    if (append) {
+      setAlertsLoadingMore(true);
+    } else {
+      setAlertsLoadingInitial(true);
+    }
+
+    try {
+      const params = new URLSearchParams();
+      params.set('limit', String(ALERTS_PAGE_SIZE));
+      if (cursor) params.set('cursor', String(cursor));
+
+      const res = await fetch(`/api/alerts/history?${params.toString()}`);
+      const data = await res.json();
+      const items: AlertItem[] = Array.isArray(data?.items) ? data.items : [];
+
+      upsertAlerts(items, append);
+      setAlertsCursor(typeof data?.nextCursor === 'number' ? data.nextCursor : null);
+      setAlertsHasMore(Boolean(data?.hasMore));
+    } catch (err) {
+      console.error('Failed to fetch alerts page', err);
+    } finally {
+      if (append) {
+        setAlertsLoadingMore(false);
+      } else {
+        setAlertsLoadingInitial(false);
+      }
+    }
+  }, [upsertAlerts]);
+
+  const fetchDailySummary = useCallback(async () => {
+    setDailyLoading(true);
+    try {
+      const res = await fetch('/api/alerts/daily-summary?days=90');
+      const data = await res.json();
+      setDailySummary(Array.isArray(data?.items) ? data.items : []);
+      setDailyLoadedOnce(true);
+    } catch (err) {
+      console.error('Failed to fetch daily summary', err);
+    } finally {
+      setDailyLoading(false);
+    }
+  }, []);
+
+  const fetchCityAlerts = useCallback(async (city: string, cursor: number | null, append: boolean) => {
+    if (!city) return;
+    if (append) {
+      setSelectedCityAlertsLoadingMore(true);
+    } else {
+      setSelectedCityAlertsLoading(true);
+    }
+
+    try {
+      const params = new URLSearchParams();
+      params.set('city', city);
+      params.set('limit', '30');
+      if (cursor) params.set('cursor', String(cursor));
+
+      const res = await fetch(`/api/alerts/by-city?${params.toString()}`);
+      const data = await res.json();
+      const items: AlertItem[] = Array.isArray(data?.items) ? data.items : [];
+
+      setSelectedSummaryCity(city);
+      setSelectedCityAlerts((prev) => {
+        if (!append) return items;
+        const merged = [...prev];
+        const seen = new Set(merged.map((a) => a.alert_id || String(a.id || '')));
+        for (const item of items) {
+          const key = item.alert_id || String(item.id || '');
+          if (seen.has(key)) continue;
+          merged.push(item);
+          seen.add(key);
+        }
+        return merged;
+      });
+      setSelectedCityAlertsCursor(typeof data?.nextCursor === 'number' ? data.nextCursor : null);
+      setSelectedCityAlertsHasMore(Boolean(data?.hasMore));
+    } catch (err) {
+      console.error('Failed to fetch city alerts', err);
+    } finally {
+      if (append) {
+        setSelectedCityAlertsLoadingMore(false);
+      } else {
+        setSelectedCityAlertsLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     document.title = 'התרעות פיקוד העורף בוט';
     const iconEl = document.querySelector("link[rel='icon']") as HTMLLinkElement | null;
     if (iconEl) {
-      iconEl.href = '/favicon-missile.svg?v=3';
+      iconEl.href = '/favicon-missile.svg?v=4';
     }
 
     fetch('/api/settings')
-      .then(res => res.json())
-      .then(data => {
+      .then((res) => res.json())
+      .then((data) => {
         setCities(data.cities || []);
         setWebhookUrl(data.webhookUrl || data.webhook_url || '');
       });
 
     fetch('/api/cities')
-      .then(res => res.json())
-      .then(data => {
+      .then((res) => res.json())
+      .then((data) => {
         if (Array.isArray(data) && data.length > 0) {
           setAllCities(data);
         } else {
-          // Fallback to our robust list if API fails or returns empty
           setAllCities(ISRAEL_CITIES);
         }
       })
-      .catch(err => {
+      .catch((err) => {
         console.error('Failed to fetch cities', err);
         setAllCities(ISRAEL_CITIES);
       });
 
-    fetch('/api/alerts/history')
-      .then(res => res.json())
-      .then(data => setAlerts(data));
+    fetchAlertsPage(null, false);
 
-    socket.on('new_alert', (alertData) => {
-      setAlerts(prev => [{ alert_id: alertData.id, data: alertData, timestamp: new Date().toISOString() }, ...prev]);
-    });
+    const onNewAlert = (alertData: any) => {
+      const liveItem: AlertItem = {
+        alert_id: alertData.id,
+        data: alertData,
+        timestamp: new Date().toISOString(),
+      };
+      setAlerts((prev) => [liveItem, ...prev.filter((a) => a.alert_id !== liveItem.alert_id)]);
+    };
+
+    socket.on('new_alert', onNewAlert);
 
     return () => {
-      socket.off('new_alert');
+      socket.off('new_alert', onNewAlert);
     };
-  }, []);
+  }, [fetchAlertsPage]);
 
   useEffect(() => {
-    if (newCity.trim()) {
-      // Use the merged list (allCities + ISRAEL_CITIES) to ensure maximum coverage
-      const combinedList = [...new Set([...allCities, ...ISRAEL_CITIES])];
-      const filtered = combinedList.filter(city => 
-        city.toLowerCase().includes(newCity.toLowerCase()) && !cities.includes(city)
-      ).slice(0, 10);
-      
-      setFilteredCities(filtered);
-      setShowSuggestions(true);
-    } else {
+    if (activeTab === 'daily' && !dailyLoadedOnce && !dailyLoading) {
+      void fetchDailySummary();
+    }
+  }, [activeTab, dailyLoadedOnce, dailyLoading, fetchDailySummary]);
+
+  useEffect(() => {
+    if (!newCity.trim()) {
       setFilteredCities([]);
       setShowSuggestions(false);
+      return;
     }
+
+    const combinedList = [...new Set([...allCities, ...ISRAEL_CITIES])];
+    const filtered = combinedList
+      .filter((city) => city.toLowerCase().includes(newCity.toLowerCase()) && !cities.includes(city))
+      .slice(0, 10);
+
+    setFilteredCities(filtered);
+    setShowSuggestions(true);
   }, [newCity, allCities, cities]);
+
+  useEffect(() => {
+    const node = loadMoreRef.current;
+    if (!node) return;
+    if (activeTab !== 'dashboard') return;
+    if (!alertsHasMore || alertsLoadingMore || alertsLoadingInitial) return;
+
+    const observer = new IntersectionObserver((entries) => {
+      const first = entries[0];
+      if (!first?.isIntersecting) return;
+      if (!alertsHasMore || alertsLoadingMore || alertsLoadingInitial) return;
+      void fetchAlertsPage(alertsCursor, true);
+    }, { rootMargin: '300px' });
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [activeTab, alertsCursor, alertsHasMore, alertsLoadingInitial, alertsLoadingMore, fetchAlertsPage]);
 
   const saveSettings = async () => {
     setIsSaving(true);
     await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cities, webhook_url: webhookUrl })
+      body: JSON.stringify({ cities, webhook_url: webhookUrl }),
     });
     setIsSaving(false);
   };
 
   const addCity = (city: string) => {
-    if (city.trim() && !cities.includes(city.trim())) {
-      setCities([...cities, city.trim()]);
+    const normalized = city.trim();
+    if (normalized && !cities.includes(normalized)) {
+      setCities([...cities, normalized]);
       setNewCity('');
       setShowSuggestions(false);
     }
   };
 
   const removeCity = (city: string) => {
-    setCities(cities.filter(c => c !== city));
+    setCities(cities.filter((c) => c !== city));
   };
 
   const addTypedCity = () => {
-    const typed = newCity.trim();
-    if (!typed) return;
-    addCity(typed);
+    addCity(newCity);
   };
+
+  const groupedDaily = useMemo(() => dailySummary, [dailySummary]);
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 font-sans" dir="rtl">
@@ -139,9 +323,9 @@ export default function App() {
           <div className="flex justify-between h-16 items-center">
             <div className="flex items-center gap-2">
               <ShieldAlert className="w-6 h-6 text-red-600" />
-              <h1 className="text-xl font-bold tracking-tight">התרעות פיקוד העורף</h1>
+              <h1 className="text-xl font-bold tracking-tight">התרעות פיקוד העורף בוט</h1>
             </div>
-            <nav className="flex gap-4">
+            <nav className="flex gap-2 sm:gap-4">
               <button
                 onClick={() => setActiveTab('dashboard')}
                 className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
@@ -149,7 +333,16 @@ export default function App() {
                 }`}
               >
                 <Bell className="w-4 h-4" />
-                לוח בקרה
+                התרעות
+              </button>
+              <button
+                onClick={() => setActiveTab('daily')}
+                className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                  activeTab === 'daily' ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-500 hover:text-zinc-900'
+                }`}
+              >
+                <BarChart3 className="w-4 h-4" />
+                סיכום יומי
               </button>
               <button
                 onClick={() => setActiveTab('settings')}
@@ -166,10 +359,10 @@ export default function App() {
       </header>
 
       <main className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {activeTab === 'dashboard' ? (
+        {activeTab === 'dashboard' && (
           <div className="space-y-6">
             <div className="flex items-center justify-between">
-              <h2 className="text-2xl font-bold tracking-tight">התרעות אחרונות</h2>
+              <h2 className="text-2xl font-bold tracking-tight">כל ההתראות</h2>
               <div className="flex items-center gap-2 text-sm text-zinc-500">
                 <span className="relative flex h-3 w-3">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -179,7 +372,11 @@ export default function App() {
               </div>
             </div>
 
-            {alerts.length === 0 ? (
+            {alertsLoadingInitial && alerts.length === 0 ? (
+              <div className="text-center py-12 bg-white rounded-xl border border-zinc-200">
+                טוען התראות...
+              </div>
+            ) : alerts.length === 0 ? (
               <div className="text-center py-12 bg-white rounded-xl border border-zinc-200">
                 <CheckCircle className="w-12 h-12 text-emerald-500 mx-auto mb-4" />
                 <h3 className="text-lg font-medium">אין התרעות פעילות</h3>
@@ -188,40 +385,152 @@ export default function App() {
             ) : (
               <div className="grid gap-4">
                 {alerts.map((alert, i) => (
-                  <div key={i} className="bg-white p-5 rounded-xl border border-zinc-200 shadow-sm flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
+                  <div key={`${alert.alert_id || alert.id || i}`} className="bg-white p-5 rounded-xl border border-zinc-200 shadow-sm flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
                     <div>
-                      <div className="flex items-center gap-2 mb-1">
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${
-                          alert.data?.cat === "10" ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                          alert.data?.cat === '10' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
                         }`}>
                           {alert.data?.categoryName || alert.data?.title || 'התרעה'}
                         </span>
-                        <span className="text-sm text-zinc-500">
-                          {formatAlertTimestamp(alert.timestamp)}
-                        </span>
+                        <span className="text-sm text-zinc-500">{formatAlertTimestamp(alert.timestamp)}</span>
                       </div>
-                      <p className="font-medium text-lg mt-2">
-                        {alert.data?.data?.join(', ')}
-                      </p>
+                      <p className="font-medium text-lg mt-2">{(alert.data?.data || []).join(', ')}</p>
                       <p className="text-zinc-600 text-sm mt-1">{alert.data?.desc}</p>
                     </div>
                   </div>
                 ))}
+                <div ref={loadMoreRef} className="h-8" />
+                {alertsLoadingMore && (
+                  <div className="text-center text-sm text-zinc-500 py-3">טוען עוד התראות...</div>
+                )}
+                {!alertsHasMore && alerts.length > 0 && (
+                  <div className="text-center text-sm text-zinc-400 py-2">הגעת לסוף הרשימה</div>
+                )}
               </div>
             )}
           </div>
-        ) : (
+        )}
+
+        {activeTab === 'daily' && (
+          <div className="space-y-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-2xl font-bold tracking-tight">סיכום יומי - ירי רקטות וטילים (איחוד 10 דקות)</h2>
+              <button
+                onClick={() => fetchDailySummary()}
+                className="px-3 py-2 rounded-md border border-zinc-300 text-sm hover:bg-zinc-100 transition-colors"
+              >
+                רענון
+              </button>
+            </div>
+
+            {dailyLoading && groupedDaily.length === 0 ? (
+              <div className="text-center py-10 bg-white rounded-xl border border-zinc-200">טוען סיכומים...</div>
+            ) : groupedDaily.length === 0 ? (
+              <div className="text-center py-10 bg-white rounded-xl border border-zinc-200">אין נתונים להצגה</div>
+            ) : (
+              <div className="space-y-4">
+                {groupedDaily.map((day) => (
+                  <div key={day.day} className="bg-white p-5 rounded-xl border border-zinc-200 shadow-sm">
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                      <h3 className="text-lg font-semibold">{formatDayLabel(day.day)}</h3>
+                      <div className="text-sm text-zinc-600">
+                        {day.categoryName || 'ירי רקטות וטילים'} (מאוחד &lt; 10 דק׳): <span className="font-semibold text-red-700">{day.missileCount}</span>
+                      </div>
+                    </div>
+
+                    {day.cities.length === 0 ? (
+                      <p className="text-sm text-zinc-500">אין ערים ליום זה</p>
+                    ) : (
+                      <div className="grid gap-2">
+                        {day.cities.map((city) => (
+                          <button
+                            type="button"
+                            key={`${day.day}-${city.city}`}
+                            onClick={() => fetchCityAlerts(city.city, null, false)}
+                            className={`flex items-center justify-between text-sm bg-zinc-50 border rounded-lg px-3 py-2 text-right transition-colors ${
+                              selectedSummaryCity === city.city ? 'border-emerald-500 bg-emerald-50' : 'border-zinc-200 hover:bg-zinc-100'
+                            }`}
+                          >
+                            <span className="font-medium">{city.city}</span>
+                            <span className="text-zinc-600">
+                              {day.categoryName || 'ירי רקטות וטילים'}: <b className="text-red-700">{city.missileCount}</b>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {selectedSummaryCity && (
+                  <div className="bg-white p-5 rounded-xl border border-zinc-200 shadow-sm">
+                    <div className="flex items-center justify-between gap-3 mb-3">
+                      <h3 className="text-lg font-semibold">כל ההתראות עבור: {selectedSummaryCity}</h3>
+                      <button
+                        type="button"
+                        onClick={() => fetchCityAlerts(selectedSummaryCity, null, false)}
+                        className="px-3 py-1.5 rounded-md border border-zinc-300 text-sm hover:bg-zinc-100 transition-colors"
+                      >
+                        רענון
+                      </button>
+                    </div>
+
+                    {selectedCityAlertsLoading && selectedCityAlerts.length === 0 ? (
+                      <p className="text-sm text-zinc-500">טוען התראות לעיר...</p>
+                    ) : selectedCityAlerts.length === 0 ? (
+                      <p className="text-sm text-zinc-500">לא נמצאו התראות לעיר זו.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {selectedCityAlerts.map((alert, i) => (
+                          <div key={`${alert.alert_id || alert.id || i}`} className="border border-zinc-200 rounded-lg p-3 bg-zinc-50">
+                            <div className="flex items-center gap-2 text-xs mb-1 flex-wrap">
+                              <span className={`px-2 py-0.5 rounded-full ${
+                                alert.data?.cat === '10' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                              }`}>
+                                {alert.data?.categoryName || alert.data?.title || 'התרעה'}
+                              </span>
+                              <span className="text-zinc-500">{formatAlertTimestamp(alert.timestamp)}</span>
+                            </div>
+                            <div className="text-sm font-medium">{(alert.data?.data || []).join(', ')}</div>
+                            <div className="text-xs text-zinc-600 mt-1">{alert.data?.desc}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {selectedCityAlertsHasMore && (
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          disabled={selectedCityAlertsLoadingMore || !selectedSummaryCity}
+                          onClick={() => {
+                            if (!selectedSummaryCity) return;
+                            fetchCityAlerts(selectedSummaryCity, selectedCityAlertsCursor, true);
+                          }}
+                          className="px-4 py-2 rounded-md border border-zinc-300 text-sm hover:bg-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {selectedCityAlertsLoadingMore ? 'טוען...' : 'טען עוד התראות'}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'settings' && (
           <div className="max-w-2xl mx-auto space-y-8">
             <div>
               <h2 className="text-2xl font-bold tracking-tight mb-6">הגדרות מערכת</h2>
-              
+
               <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-sm space-y-6">
                 <div>
-                  <label className="block text-sm font-medium text-zinc-700 mb-2">
-                    כתובת Webhook
-                  </label>
+                  <label className="block text-sm font-medium text-zinc-700 mb-2">כתובת Webhook</label>
                   <p className="text-sm text-zinc-500 mb-3">
-                    הכתובת אליה יישלחו בקשות POST בעת קבלת התרעה או הודעת שחרור באזורים המוגדרים.
+                    הכתובת אליה יישלחו בקשות POST בעת קבלת התרעה או הודעת חזרה לשגרה.
                   </p>
                   <input
                     type="url"
@@ -236,13 +545,9 @@ export default function App() {
                 <hr className="border-zinc-200" />
 
                 <div>
-                  <label className="block text-sm font-medium text-zinc-700 mb-2">
-                    אזורי התרעה (ערים / יישובים)
-                  </label>
-                  <p className="text-sm text-zinc-500 mb-3">
-                    חפש ובחר את שמות היישובים מתוך הרשימה הרשמית.
-                  </p>
-                  
+                  <label className="block text-sm font-medium text-zinc-700 mb-2">אזורי התרעה (ערים / יישובים)</label>
+                  <p className="text-sm text-zinc-500 mb-3">חפש ובחר יישובים, או הוסף ידנית עם Enter / כפתור +.</p>
+
                   <div className="relative mb-4">
                     <div className="flex gap-2">
                       <div className="relative flex-1">
@@ -263,7 +568,7 @@ export default function App() {
                         />
                         {showSuggestions && filteredCities.length > 0 && (
                           <div className="absolute z-20 w-full mt-1 bg-white border border-zinc-200 rounded-lg shadow-lg max-h-60 overflow-y-auto">
-                            {filteredCities.map(city => (
+                            {filteredCities.map((city) => (
                               <button
                                 key={city}
                                 onClick={() => addCity(city)}
@@ -288,13 +593,10 @@ export default function App() {
                   </div>
 
                   <div className="flex flex-wrap gap-2">
-                    {cities.map(city => (
+                    {cities.map((city) => (
                       <span key={city} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-zinc-100 border border-zinc-200 text-sm font-medium">
                         {city}
-                        <button
-                          onClick={() => removeCity(city)}
-                          className="text-zinc-500 hover:text-red-600 transition-colors"
-                        >
+                        <button onClick={() => removeCity(city)} className="text-zinc-500 hover:text-red-600 transition-colors">
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </span>

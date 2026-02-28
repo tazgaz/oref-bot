@@ -99,8 +99,194 @@ app.get('/api/cooldown/status', (req, res) => {
 });
 
 app.get('/api/alerts/history', (req, res) => {
-  const alerts = db.prepare('SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 50').all() as any[];
-  res.json(alerts.map(a => ({ ...a, data: JSON.parse(a.data) })));
+  const rawLimit = Number(req.query.limit);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : 50;
+  const rawCursor = Number(req.query.cursor);
+  const hasCursor = Number.isFinite(rawCursor) && rawCursor > 0;
+
+  const query = hasCursor
+    ? 'SELECT * FROM alerts WHERE id < ? ORDER BY id DESC LIMIT ?'
+    : 'SELECT * FROM alerts ORDER BY id DESC LIMIT ?';
+  const alerts = hasCursor
+    ? db.prepare(query).all(rawCursor, limit) as any[]
+    : db.prepare(query).all(limit) as any[];
+
+  const items = alerts.map((a) => ({ ...a, data: JSON.parse(a.data) }));
+  const nextCursor = items.length > 0 ? items[items.length - 1].id : null;
+
+  res.json({
+    items,
+    nextCursor,
+    hasMore: items.length === limit
+  });
+});
+
+app.get('/api/alerts/daily-summary', (req, res) => {
+  const MERGE_WINDOW_MS = 10 * 60 * 1000;
+  const MISSILE_CATEGORY = '1';
+  const rawDays = Number(req.query.days);
+  const days = Number.isFinite(rawDays) ? Math.min(Math.max(rawDays, 1), 365) : 30;
+  const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get() as any;
+  const monitoredCities = JSON.parse(settings.cities || '[]');
+  const monitoredCityList = (Array.isArray(monitoredCities) ? monitoredCities : [])
+    .filter((c: unknown): c is string => typeof c === 'string')
+    .map((c: string) => normalizeCityName(c))
+    .filter(Boolean);
+  const rows = db.prepare('SELECT * FROM alerts ORDER BY id DESC').all() as any[];
+  const now = new Date();
+  const from = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+  const dailyMap = new Map<string, {
+    day: string;
+    cityTimestamps: Map<string, number[]>;
+  }>();
+
+  const toTimestampMs = (value: string) => {
+    const localDbMatch = value.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+    if (localDbMatch) {
+      const [, y, m, d, hh, mm, ss] = localDbMatch;
+      return new Date(`${y}-${m}-${d}T${hh}:${mm}:${ss}+02:00`).getTime();
+    }
+    return new Date(value).getTime();
+  };
+
+  for (const row of rows) {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(row.data);
+    } catch {
+      continue;
+    }
+
+    if (String(parsed?.cat || '') !== MISSILE_CATEGORY) {
+      continue;
+    }
+
+    const cities = Array.isArray(parsed?.data) ? parsed.data.filter((c: unknown): c is string => typeof c === 'string') : [];
+    const ts = String(row.timestamp || '');
+    const tsMs = toTimestampMs(ts);
+    if (!Number.isFinite(tsMs)) continue;
+    const tsDate = new Date(tsMs);
+    if (tsDate < from) continue;
+    const day = tsDate.toISOString().slice(0, 10);
+
+    const matchedMonitoredCities = cities
+      .map((alertCity: string) => monitoredCityList.find((monitoredCity: string) => isCityMatch(monitoredCity, alertCity)) || null)
+      .filter((city: string | null): city is string => Boolean(city));
+    const uniqueMatchedMonitoredCities = Array.from(new Set(matchedMonitoredCities));
+
+    if (uniqueMatchedMonitoredCities.length === 0) {
+      continue;
+    }
+
+    if (!dailyMap.has(day)) {
+      dailyMap.set(day, {
+        day,
+        cityTimestamps: new Map()
+      });
+    }
+
+    const dayEntry = dailyMap.get(day)!;
+    for (const city of uniqueMatchedMonitoredCities) {
+      if (!dayEntry.cityTimestamps.has(city)) {
+        dayEntry.cityTimestamps.set(city, []);
+      }
+      dayEntry.cityTimestamps.get(city)!.push(tsMs);
+    }
+  }
+
+  const daysSummary = Array.from(dailyMap.values())
+    .sort((a, b) => b.day.localeCompare(a.day))
+    .map((dayEntry) => {
+      const cities = Array.from(dayEntry.cityTimestamps.entries()).map(([city, timestamps]) => {
+        const sorted = [...timestamps].sort((a, b) => a - b);
+        let mergedCount = 0;
+        let lastTs = -Infinity;
+        for (const t of sorted) {
+          if (t - lastTs >= MERGE_WINDOW_MS) {
+            mergedCount += 1;
+          }
+          lastTs = t;
+        }
+        return {
+          city,
+          alertsCount: mergedCount,
+          missileCount: mergedCount
+        };
+      }).sort((a, b) => b.missileCount - a.missileCount || b.alertsCount - a.alertsCount || a.city.localeCompare(b.city));
+
+      const totalMerged = cities.reduce((sum, c) => sum + c.missileCount, 0);
+      return {
+        day: dayEntry.day,
+        category: MISSILE_CATEGORY,
+        categoryName: CATEGORY_MAP[MISSILE_CATEGORY] || 'ירי רקטות וטילים',
+        mergeWindowMinutes: 10,
+        alertsCount: totalMerged,
+        missileCount: totalMerged,
+        cities
+      };
+    });
+
+  res.json({
+    days,
+    generatedAt: new Date().toISOString(),
+    items: daysSummary
+  });
+});
+
+app.get('/api/alerts/by-city', (req, res) => {
+  const city = String(req.query.city || '').trim();
+  if (!city) {
+    res.status(400).json({ error: 'city is required' });
+    return;
+  }
+
+  const rawLimit = Number(req.query.limit);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : 50;
+  const rawCursor = Number(req.query.cursor);
+  const initialCursor = Number.isFinite(rawCursor) && rawCursor > 0 ? rawCursor : Number.MAX_SAFE_INTEGER;
+
+  const chunkSize = 300;
+  const targetCount = limit + 1;
+  const matched: any[] = [];
+  let scanCursor = initialCursor;
+  let reachedEnd = false;
+
+  while (matched.length < targetCount) {
+    const rows = db.prepare('SELECT * FROM alerts WHERE id < ? ORDER BY id DESC LIMIT ?').all(scanCursor, chunkSize) as any[];
+    if (rows.length === 0) {
+      reachedEnd = true;
+      break;
+    }
+
+    for (const row of rows) {
+      scanCursor = row.id;
+      let parsed: any;
+      try {
+        parsed = JSON.parse(row.data);
+      } catch {
+        continue;
+      }
+
+      const cities = Array.isArray(parsed?.data) ? parsed.data.filter((c: unknown): c is string => typeof c === 'string') : [];
+      const hasCity = cities.some((alertCity: string) => isCityMatch(city, alertCity));
+      if (!hasCity) continue;
+
+      matched.push({ ...row, data: parsed });
+      if (matched.length >= targetCount) break;
+    }
+  }
+
+  const hasMore = matched.length > limit || !reachedEnd;
+  const items = matched.slice(0, limit);
+  const nextCursor = items.length > 0 ? items[items.length - 1].id : null;
+
+  res.json({
+    city,
+    items,
+    nextCursor,
+    hasMore
+  });
 });
 
 app.post('/api/webhook/test', async (req, res) => {
