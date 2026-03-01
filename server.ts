@@ -15,11 +15,12 @@ const WEBHOOK_LOG_PATH = process.env.WEBHOOK_LOG_PATH || path.join(process.cwd()
 const APP_TIMEZONE = process.env.TZ || 'Asia/Jerusalem';
 const RUNNING_IN_DOCKER = process.env.RUNNING_IN_CONTAINER === 'true' || existsSync('/.dockerenv');
 const CITY_WEBHOOK_COOLDOWN_MS = 3 * 60 * 1000;
+const ALL_CLEAR_CITY_WEBHOOK_COOLDOWN_MS = 10 * 60 * 1000;
 let lastPollAt: string | null = null;
 let lastPollOk = true;
 let lastPollStatusCode: number | null = null;
 let lastPollError: string | null = null;
-const cityLastWebhookAt = new Map<string, number>();
+const cityLastWebhookAt = new Map<string, { lastSentAtMs: number; cooldownMs: number; reason: 'DEFAULT' | 'ALL_CLEAR' }>();
 
 app.use(express.json());
 
@@ -70,33 +71,40 @@ app.get('/api/cooldown/status', (req, res) => {
     .filter((c: unknown): c is string => typeof c === 'string')
     .map((city: string) => {
       const key = cooldownCityKey(city);
-      const lastSentAtMs = cityLastWebhookAt.get(key) || 0;
-      const remainingMs = Math.max(0, CITY_WEBHOOK_COOLDOWN_MS - (nowMs - lastSentAtMs));
+      const entry = cityLastWebhookAt.get(key);
+      const lastSentAtMs = entry?.lastSentAtMs || 0;
+      const cooldownMs = entry?.cooldownMs || CITY_WEBHOOK_COOLDOWN_MS;
+      const remainingMs = Math.max(0, cooldownMs - (nowMs - lastSentAtMs));
       const active = remainingMs > 0;
       return {
         city,
         key,
         active,
+        cooldownMs,
+        reason: entry?.reason || null,
         remainingMs,
         lastSentAt: lastSentAtMs ? new Date(lastSentAtMs).toISOString() : null
       };
     });
 
   const active = Array.from(cityLastWebhookAt.entries())
-    .map(([key, lastSentAtMs]) => {
-      const remainingMs = Math.max(0, CITY_WEBHOOK_COOLDOWN_MS - (nowMs - lastSentAtMs));
+    .map(([key, entry]) => {
+      const remainingMs = Math.max(0, entry.cooldownMs - (nowMs - entry.lastSentAtMs));
       return {
         key,
         active: remainingMs > 0,
+        cooldownMs: entry.cooldownMs,
+        reason: entry.reason,
         remainingMs,
-        lastSentAt: new Date(lastSentAtMs).toISOString()
+        lastSentAt: new Date(entry.lastSentAtMs).toISOString()
       };
     })
     .filter((entry) => entry.active)
     .sort((a, b) => b.remainingMs - a.remainingMs);
 
   res.json({
-    cooldownMs: CITY_WEBHOOK_COOLDOWN_MS,
+    defaultCooldownMs: CITY_WEBHOOK_COOLDOWN_MS,
+    allClearCooldownMs: ALL_CLEAR_CITY_WEBHOOK_COOLDOWN_MS,
     now: new Date(nowMs).toISOString(),
     monitored,
     active
@@ -110,8 +118,8 @@ app.get('/api/system/status', (req, res) => {
     .filter((c: unknown): c is string => typeof c === 'string');
 
   const nowMs = Date.now();
-  const activeCooldownCount = Array.from(cityLastWebhookAt.values()).reduce((count, lastSentAtMs) => {
-    const remainingMs = Math.max(0, CITY_WEBHOOK_COOLDOWN_MS - (nowMs - lastSentAtMs));
+  const activeCooldownCount = Array.from(cityLastWebhookAt.values()).reduce((count, entry) => {
+    const remainingMs = Math.max(0, entry.cooldownMs - (nowMs - entry.lastSentAtMs));
     return count + (remainingMs > 0 ? 1 : 0);
   }, 0);
 
@@ -147,6 +155,8 @@ app.get('/api/system/status', (req, res) => {
     },
     webhookConfigured: Boolean(settings.webhook_url),
     monitoredCitiesCount: monitoredCityList.length,
+    defaultCooldownMs: CITY_WEBHOOK_COOLDOWN_MS,
+    allClearCooldownMs: ALL_CLEAR_CITY_WEBHOOK_COOLDOWN_MS,
     activeCooldownCount,
     latestAlert
   });
@@ -555,6 +565,7 @@ function handleAlerts(alertData: any) {
 
     if (matchedCities.length > 0 && webhookUrl) {
       const isAllClear = category === "10";
+      const cooldownMsForAlert = isAllClear ? ALL_CLEAR_CITY_WEBHOOK_COOLDOWN_MS : CITY_WEBHOOK_COOLDOWN_MS;
       const nowMs = Date.now();
       const citiesToSend: string[] = [];
       const cooldownSkippedCities: string[] = [];
@@ -565,8 +576,10 @@ function handleAlerts(alertData: any) {
         if (!key || seenKeys.has(key)) continue;
         seenKeys.add(key);
 
-        const lastSentAt = cityLastWebhookAt.get(key) || 0;
-        if (nowMs - lastSentAt < CITY_WEBHOOK_COOLDOWN_MS) {
+        const cooldownEntry = cityLastWebhookAt.get(key);
+        const lastSentAt = cooldownEntry?.lastSentAtMs || 0;
+        const activeCooldownMs = cooldownEntry?.cooldownMs || CITY_WEBHOOK_COOLDOWN_MS;
+        if (nowMs - lastSentAt < activeCooldownMs) {
           cooldownSkippedCities.push(city);
           continue;
         }
@@ -579,14 +592,18 @@ function handleAlerts(alertData: any) {
           time: new Date().toISOString(),
           status: 'SKIPPED_CITY_COOLDOWN',
           alertId,
-          cooldownMs: CITY_WEBHOOK_COOLDOWN_MS,
+          cooldownMs: cooldownMsForAlert,
           matchedCities: matchedCities.slice(0, 20)
         });
         return;
       }
 
       for (const city of citiesToSend) {
-        cityLastWebhookAt.set(cooldownCityKey(city), nowMs);
+        cityLastWebhookAt.set(cooldownCityKey(city), {
+          lastSentAtMs: nowMs,
+          cooldownMs: cooldownMsForAlert,
+          reason: isAllClear ? 'ALL_CLEAR' : 'DEFAULT'
+        });
       }
 
       if (cooldownSkippedCities.length > 0) {
@@ -594,7 +611,7 @@ function handleAlerts(alertData: any) {
           time: new Date().toISOString(),
           status: 'PARTIAL_CITY_COOLDOWN',
           alertId,
-          cooldownMs: CITY_WEBHOOK_COOLDOWN_MS,
+          cooldownMs: cooldownMsForAlert,
           sentCities: citiesToSend.slice(0, 20),
           skippedCities: cooldownSkippedCities.slice(0, 20)
         });

@@ -20,11 +20,6 @@ import { ISRAEL_CITIES } from './constants/cities';
 
 const socket = io();
 const ALERTS_PAGE_SIZE = 50;
-const DAY_MS = 24 * 60 * 60 * 1000;
-const FILTERED_ALERT_PATTERNS = [
-  /ניתן\s+לצאת\s+מהמרחב\s+המוגן\s+אך\s+יש\s+להישאר\s+בקרבתו/i,
-];
-const PREWARNING_ALERT_PATTERN = /בדקות\s+הקרובות\s+צפויות?\s+להתקבל\s+התרעות?\s+בא[י]?זורך/i;
 
 type TabKey = 'dashboard' | 'daily' | 'settings';
 
@@ -108,17 +103,6 @@ function formatDayLabel(day: string) {
   return `${m[3]}/${m[2]}/${m[1]}`;
 }
 
-function parseTimestamp(value: string) {
-  const localDbMatch = value.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
-  if (localDbMatch) {
-    const [, year, month, day, hh, mm, ss] = localDbMatch;
-    return new Date(`${year}-${month}-${day}T${hh}:${mm}:${ss}+02:00`);
-  }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
-}
-
 function formatRelative(isoValue: string | null | undefined) {
   if (!isoValue) return 'לא ידוע';
   const d = new Date(isoValue);
@@ -143,25 +127,6 @@ function isValidWebhookUrl(value: string) {
   }
 }
 
-function normalizeAlertText(value: string | undefined) {
-  return (value || '')
-    .normalize('NFKC')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function shouldFilterAlert(desc: string | undefined, title: string | undefined) {
-  const combined = `${normalizeAlertText(title)} ${normalizeAlertText(desc)}`.trim();
-  if (!combined) return false;
-  return FILTERED_ALERT_PATTERNS.some((pattern) => pattern.test(combined));
-}
-
-function isPrewarningAlert(desc: string | undefined, title: string | undefined) {
-  const combined = `${normalizeAlertText(title)} ${normalizeAlertText(desc)}`.trim();
-  if (!combined) return false;
-  return PREWARNING_ALERT_PATTERN.test(combined);
-}
-
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
@@ -169,10 +134,6 @@ export default function App() {
   const [alertsHasMore, setAlertsHasMore] = useState(true);
   const [alertsLoadingInitial, setAlertsLoadingInitial] = useState(false);
   const [alertsLoadingMore, setAlertsLoadingMore] = useState(false);
-  const [dashboardCityFilter, setDashboardCityFilter] = useState('');
-  const [dashboardCategoryFilter, setDashboardCategoryFilter] = useState('all');
-  const [dashboardPrewarningFilter, setDashboardPrewarningFilter] = useState<'all' | 'only' | 'hide'>('all');
-  const [dashboardOnly24h, setDashboardOnly24h] = useState(false);
   const [socketConnected, setSocketConnected] = useState(socket.connected);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
 
@@ -497,53 +458,6 @@ export default function App() {
 
   const groupedDaily = useMemo(() => dailySummary, [dailySummary]);
 
-  const filteredAlerts = useMemo(() => {
-    return alerts.filter((alert) => {
-      if (shouldFilterAlert(alert.data?.desc, alert.data?.title)) {
-        return false;
-      }
-
-      const isPrewarning = isPrewarningAlert(alert.data?.desc, alert.data?.title);
-      if (dashboardPrewarningFilter === 'only' && !isPrewarning) {
-        return false;
-      }
-      if (dashboardPrewarningFilter === 'hide' && isPrewarning) {
-        return false;
-      }
-
-      if (dashboardCategoryFilter !== 'all' && String(alert.data?.cat || '') !== dashboardCategoryFilter) {
-        return false;
-      }
-      if (dashboardCityFilter.trim()) {
-        const q = dashboardCityFilter.trim().toLowerCase();
-        const hasCity = (alert.data?.data || []).some((city) => city.toLowerCase().includes(q));
-        if (!hasCity) return false;
-      }
-      if (dashboardOnly24h) {
-        const d = parseTimestamp(alert.timestamp);
-        if (!d) return false;
-        if (Date.now() - d.getTime() > DAY_MS) return false;
-      }
-      return true;
-    });
-  }, [alerts, dashboardCategoryFilter, dashboardCityFilter, dashboardOnly24h, dashboardPrewarningFilter]);
-
-  const categoryOptions = useMemo(() => {
-    const items = new Map<string, string>();
-    for (const alert of alerts) {
-      if (shouldFilterAlert(alert.data?.desc, alert.data?.title)) continue;
-      const cat = String(alert.data?.cat || '');
-      if (!cat) continue;
-      items.set(cat, alert.data?.title || alert.data?.categoryName || `קטגוריה ${cat}`);
-    }
-    return Array.from(items.entries()).map(([value, label]) => ({ value, label }));
-  }, [alerts]);
-
-  const visibleSelectedCityAlerts = useMemo(
-    () => selectedCityAlerts.filter((alert) => !shouldFilterAlert(alert.data?.desc, alert.data?.title)),
-    [selectedCityAlerts]
-  );
-
   const dailyTrend = useMemo(() => {
     const sorted = [...dailySummary].sort((a, b) => b.day.localeCompare(a.day));
     const current = sorted.slice(0, 7).reduce((sum, item) => sum + item.missileCount, 0);
@@ -659,70 +573,19 @@ export default function App() {
               </div>
             </div>
 
-            <div className="bg-white rounded-xl border border-zinc-200 p-3 sm:p-4 grid gap-2 sm:grid-cols-12">
-              <input
-                value={dashboardCityFilter}
-                onChange={(e) => setDashboardCityFilter(e.target.value)}
-                placeholder="סינון לפי עיר"
-                className="sm:col-span-3 px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none"
-              />
-              <select
-                value={dashboardCategoryFilter}
-                onChange={(e) => setDashboardCategoryFilter(e.target.value)}
-                className="sm:col-span-3 px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none bg-white"
-              >
-                <option value="all">כל הסוגים</option>
-                {categoryOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={dashboardPrewarningFilter}
-                onChange={(e) => setDashboardPrewarningFilter(e.target.value as 'all' | 'only' | 'hide')}
-                className="sm:col-span-3 px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none bg-white"
-              >
-                <option value="all">הודעות בדקות הקרובות: הכל</option>
-                <option value="only">רק בדקות הקרובות</option>
-                <option value="hide">הסתר בדקות הקרובות</option>
-              </select>
-              <button
-                type="button"
-                onClick={() => setDashboardOnly24h((prev) => !prev)}
-                className={`sm:col-span-2 px-3 py-2 rounded-lg border transition-colors ${
-                  dashboardOnly24h ? 'bg-zinc-900 text-white border-zinc-900' : 'bg-white border-zinc-300 hover:bg-zinc-100'
-                }`}
-              >
-                24 שעות
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setDashboardCityFilter('');
-                  setDashboardCategoryFilter('all');
-                  setDashboardPrewarningFilter('all');
-                  setDashboardOnly24h(false);
-                }}
-                className="sm:col-span-1 px-3 py-2 rounded-lg border border-zinc-300 bg-white hover:bg-zinc-100"
-              >
-                נקה
-              </button>
-            </div>
-
             {alertsLoadingInitial && alerts.length === 0 ? (
               <div className="text-center py-12 bg-white rounded-xl border border-zinc-200">
                 טוען התראות...
               </div>
-            ) : filteredAlerts.length === 0 ? (
+            ) : alerts.length === 0 ? (
               <div className="text-center py-12 bg-white rounded-xl border border-zinc-200">
                 <CheckCircle className="w-12 h-12 text-emerald-500 mx-auto mb-4" />
-                <h3 className="text-lg font-medium">לא נמצאו התראות לתצוגה</h3>
-                <p className="text-zinc-500 mt-1">נסה לעדכן את הסינון או להמתין לעדכון הבא</p>
+                <h3 className="text-lg font-medium">אין התרעות פעילות</h3>
+                <p className="text-zinc-500 mt-1">המערכת מנטרת התרעות בזמן אמת</p>
               </div>
             ) : (
               <div className="grid gap-4">
-                {filteredAlerts.map((alert, i) => (
+                {alerts.map((alert, i) => (
                   <div key={`${alert.alert_id || alert.id || i}`} className="bg-white p-5 rounded-xl border border-zinc-200 shadow-sm flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
                     <div>
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
@@ -742,7 +605,7 @@ export default function App() {
                 {alertsLoadingMore && (
                   <div className="text-center text-sm text-zinc-500 py-3">טוען עוד התראות...</div>
                 )}
-                {!alertsHasMore && filteredAlerts.length > 0 && (
+                {!alertsHasMore && alerts.length > 0 && (
                   <div className="text-center text-sm text-zinc-400 py-2">הגעת לסוף הרשימה</div>
                 )}
               </div>
@@ -834,13 +697,13 @@ export default function App() {
                       </button>
                     </div>
 
-                    {selectedCityAlertsLoading && visibleSelectedCityAlerts.length === 0 ? (
+                    {selectedCityAlertsLoading && selectedCityAlerts.length === 0 ? (
                       <p className="text-sm text-zinc-500">טוען התראות לעיר...</p>
-                    ) : visibleSelectedCityAlerts.length === 0 ? (
+                    ) : selectedCityAlerts.length === 0 ? (
                       <p className="text-sm text-zinc-500">לא נמצאו התראות לעיר זו.</p>
                     ) : (
                       <div className="space-y-2">
-                        {visibleSelectedCityAlerts.map((alert, i) => (
+                        {selectedCityAlerts.map((alert, i) => (
                           <div key={`${alert.alert_id || alert.id || i}`} className="border border-zinc-200 rounded-lg p-3 bg-zinc-50">
                             <div className="flex items-center gap-2 text-xs mb-1 flex-wrap">
                               <span className={`px-2 py-0.5 rounded-full ${
