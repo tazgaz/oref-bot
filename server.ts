@@ -15,6 +15,11 @@ const WEBHOOK_LOG_PATH = process.env.WEBHOOK_LOG_PATH || path.join(process.cwd()
 const APP_TIMEZONE = process.env.TZ || 'Asia/Jerusalem';
 const RUNNING_IN_DOCKER = process.env.RUNNING_IN_CONTAINER === 'true' || existsSync('/.dockerenv');
 const CITY_WEBHOOK_COOLDOWN_MS = 3 * 60 * 1000;
+let lastPollAt: string | null = null;
+let lastPollOk = true;
+let lastPollStatusCode: number | null = null;
+let lastPollError: string | null = null;
+const cityLastWebhookAt = new Map<string, number>();
 
 app.use(express.json());
 
@@ -95,6 +100,55 @@ app.get('/api/cooldown/status', (req, res) => {
     now: new Date(nowMs).toISOString(),
     monitored,
     active
+  });
+});
+
+app.get('/api/system/status', (req, res) => {
+  const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get() as any;
+  const monitoredCities = JSON.parse(settings.cities || '[]');
+  const monitoredCityList = (Array.isArray(monitoredCities) ? monitoredCities : [])
+    .filter((c: unknown): c is string => typeof c === 'string');
+
+  const nowMs = Date.now();
+  const activeCooldownCount = Array.from(cityLastWebhookAt.values()).reduce((count, lastSentAtMs) => {
+    const remainingMs = Math.max(0, CITY_WEBHOOK_COOLDOWN_MS - (nowMs - lastSentAtMs));
+    return count + (remainingMs > 0 ? 1 : 0);
+  }, 0);
+
+  const latestRow = db.prepare('SELECT * FROM alerts ORDER BY id DESC LIMIT 1').get() as any;
+  let latestAlert: Record<string, unknown> | null = null;
+
+  if (latestRow?.data) {
+    try {
+      const parsed = JSON.parse(latestRow.data);
+      latestAlert = {
+        id: latestRow.id,
+        alertId: parsed?.id || latestRow.alert_id || null,
+        timestamp: latestRow.timestamp || null,
+        category: String(parsed?.cat || ''),
+        categoryName: parsed?.categoryName || parsed?.title || null,
+        cities: Array.isArray(parsed?.data) ? parsed.data.length : 0
+      };
+    } catch {
+      latestAlert = {
+        id: latestRow.id,
+        timestamp: latestRow.timestamp || null
+      };
+    }
+  }
+
+  res.json({
+    now: new Date(nowMs).toISOString(),
+    poll: {
+      lastPollAt,
+      ok: lastPollOk,
+      statusCode: lastPollStatusCode,
+      error: lastPollError
+    },
+    webhookConfigured: Boolean(settings.webhook_url),
+    monitoredCitiesCount: monitoredCityList.length,
+    activeCooldownCount,
+    latestAlert
   });
 });
 
@@ -299,7 +353,7 @@ app.post('/api/webhook/test', async (req, res) => {
     return;
   }
 
-  await sendWebhook(webhookUrl, {
+  const result = await sendWebhook(webhookUrl, {
     type: 'TEST',
     category: '0',
     categoryName: 'בדיקת חיבור',
@@ -308,6 +362,11 @@ app.post('/api/webhook/test', async (req, res) => {
     desc: 'Manual webhook connectivity test',
     time: new Date().toISOString()
   });
+
+  if (!result.ok) {
+    res.status(502).json({ success: false, error: result.error || `webhook failed (${result.status ?? 'unknown'})` });
+    return;
+  }
 
   res.json({ success: true, webhook_url: webhookUrl, city });
 });
@@ -346,10 +405,10 @@ app.get('/api/cities', async (req, res) => {
 
 // Polling Pikud HaOref
 let lastAlertId = '';
-const cityLastWebhookAt = new Map<string, number>();
 
 async function pollAlerts() {
   try {
+    lastPollAt = new Date().toISOString();
     const response = await fetch('https://www.oref.org.il/WarningMessages/alert/alerts.json', {
       headers: {
         'Referer': 'https://www.oref.org.il/',
@@ -357,6 +416,10 @@ async function pollAlerts() {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
       }
     });
+
+    lastPollStatusCode = response.status;
+    lastPollOk = response.ok;
+    lastPollError = response.ok ? null : `HTTP ${response.status}`;
 
     if (response.status === 200) {
       const text = await response.text();
@@ -370,6 +433,10 @@ async function pollAlerts() {
       }
     }
   } catch (error) {
+    lastPollAt = new Date().toISOString();
+    lastPollOk = false;
+    lastPollStatusCode = null;
+    lastPollError = error instanceof Error ? error.message : String(error);
     console.error('Error polling alerts:', error);
   }
   setTimeout(pollAlerts, 2000);
@@ -442,7 +509,8 @@ function handleAlerts(alertData: any) {
   const alertId = alertData.id;
   const cities = alertData.data || [];
   const category = String(alertData.cat || "1");
-  const categoryName = CATEGORY_MAP[category] || alertData.title || "התרעה";
+  // Prefer title from Oref payload; local map is fallback only.
+  const categoryName = alertData.title || CATEGORY_MAP[category] || "התרעה";
   
   try {
     const enrichedData = { ...alertData, categoryName };
@@ -554,7 +622,7 @@ function handleAlerts(alertData: any) {
   }
 }
 
-async function sendWebhook(url: string, payload: any) {
+async function sendWebhook(url: string, payload: any): Promise<{ ok: boolean; status?: number; error?: string }> {
   let targetUrl = url;
   try {
     const parsed = new URL(url);
@@ -586,14 +654,17 @@ async function sendWebhook(url: string, payload: any) {
       ok: response.ok
     });
     console.log('Webhook sent:', payload.type);
+    return { ok: response.ok, status: response.status };
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
     await writeWebhookLog({
       ...logEntryBase,
       status: 'FAILED',
       ok: false,
-      error: error instanceof Error ? error.message : String(error)
+      error: errorMessage
     });
     console.error('Webhook failed:', error);
+    return { ok: false, error: errorMessage };
   }
 }
 

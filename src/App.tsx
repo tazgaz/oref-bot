@@ -1,10 +1,26 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { BarChart3, Bell, CheckCircle, Plus, Settings, ShieldAlert, Trash2 } from 'lucide-react';
+import {
+  BarChart3,
+  Bell,
+  CheckCircle,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Settings,
+  ShieldAlert,
+  ShieldCheck,
+  Siren,
+  TestTube2,
+  Trash2,
+  Wifi,
+  WifiOff,
+} from 'lucide-react';
 import { ISRAEL_CITIES } from './constants/cities';
 
 const socket = io();
 const ALERTS_PAGE_SIZE = 50;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 type TabKey = 'dashboard' | 'daily' | 'settings';
 
@@ -36,6 +52,22 @@ type DailySummaryItem = {
   categoryName?: string;
   mergeWindowMinutes?: number;
   cities: DailyCityItem[];
+};
+
+type FeedbackType = 'success' | 'warning' | 'error';
+
+type SystemStatus = {
+  poll?: {
+    lastPollAt?: string | null;
+    ok?: boolean;
+    error?: string | null;
+  };
+  webhookConfigured?: boolean;
+  monitoredCitiesCount?: number;
+  activeCooldownCount?: number;
+  latestAlert?: {
+    category?: string;
+  } | null;
 };
 
 function formatInIsraelTimezone(date: Date) {
@@ -72,6 +104,41 @@ function formatDayLabel(day: string) {
   return `${m[3]}/${m[2]}/${m[1]}`;
 }
 
+function parseTimestamp(value: string) {
+  const localDbMatch = value.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+  if (localDbMatch) {
+    const [, year, month, day, hh, mm, ss] = localDbMatch;
+    return new Date(`${year}-${month}-${day}T${hh}:${mm}:${ss}+02:00`);
+  }
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+function formatRelative(isoValue: string | null | undefined) {
+  if (!isoValue) return 'לא ידוע';
+  const d = new Date(isoValue);
+  if (Number.isNaN(d.getTime())) return 'לא ידוע';
+  const diffSec = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+  if (diffSec < 5) return 'הרגע';
+  if (diffSec < 60) return `לפני ${diffSec} שנ׳`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `לפני ${diffMin} דק׳`;
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour < 24) return `לפני ${diffHour} שעות`;
+  return formatAlertTimestamp(isoValue);
+}
+
+function isValidWebhookUrl(value: string) {
+  if (!value.trim()) return true;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
@@ -79,10 +146,15 @@ export default function App() {
   const [alertsHasMore, setAlertsHasMore] = useState(true);
   const [alertsLoadingInitial, setAlertsLoadingInitial] = useState(false);
   const [alertsLoadingMore, setAlertsLoadingMore] = useState(false);
+  const [dashboardCityFilter, setDashboardCityFilter] = useState('');
+  const [dashboardCategoryFilter, setDashboardCategoryFilter] = useState('all');
+  const [dashboardOnly24h, setDashboardOnly24h] = useState(false);
+  const [socketConnected, setSocketConnected] = useState(socket.connected);
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
 
   const [dailySummary, setDailySummary] = useState<DailySummaryItem[]>([]);
+  const [dailyDays, setDailyDays] = useState(90);
   const [dailyLoading, setDailyLoading] = useState(false);
-  const [dailyLoadedOnce, setDailyLoadedOnce] = useState(false);
   const [selectedSummaryCity, setSelectedSummaryCity] = useState<string | null>(null);
   const [selectedCityAlerts, setSelectedCityAlerts] = useState<AlertItem[]>([]);
   const [selectedCityAlertsCursor, setSelectedCityAlertsCursor] = useState<number | null>(null);
@@ -97,8 +169,16 @@ export default function App() {
   const [filteredCities, setFilteredCities] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isTestingWebhook, setIsTestingWebhook] = useState(false);
+  const [saveFeedback, setSaveFeedback] = useState<{ type: FeedbackType; text: string } | null>(null);
+  const [testFeedback, setTestFeedback] = useState<{ type: FeedbackType; text: string } | null>(null);
 
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
+
+  const webhookUrlError = useMemo(() => {
+    if (!webhookUrl.trim()) return null;
+    return isValidWebhookUrl(webhookUrl) ? null : 'כתובת Webhook לא תקינה (נדרש http:// או https://)';
+  }, [webhookUrl]);
 
   const upsertAlerts = useCallback((incoming: AlertItem[], append: boolean) => {
     setAlerts((prev) => {
@@ -112,6 +192,17 @@ export default function App() {
       }
       return base;
     });
+  }, []);
+
+  const fetchSystemStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/system/status');
+      if (!res.ok) return;
+      const data = await res.json();
+      setSystemStatus(data || null);
+    } catch {
+      // Keep previous status when fetch fails.
+    }
   }, []);
 
   const fetchAlertsPage = useCallback(async (cursor: number | null, append: boolean) => {
@@ -144,13 +235,12 @@ export default function App() {
     }
   }, [upsertAlerts]);
 
-  const fetchDailySummary = useCallback(async () => {
+  const fetchDailySummary = useCallback(async (days: number) => {
     setDailyLoading(true);
     try {
-      const res = await fetch('/api/alerts/daily-summary?days=90');
+      const res = await fetch(`/api/alerts/daily-summary?days=${days}`);
       const data = await res.json();
       setDailySummary(Array.isArray(data?.items) ? data.items : []);
-      setDailyLoadedOnce(true);
     } catch (err) {
       console.error('Failed to fetch daily summary', err);
     } finally {
@@ -231,6 +321,7 @@ export default function App() {
       });
 
     fetchAlertsPage(null, false);
+    void fetchSystemStatus();
 
     const onNewAlert = (alertData: any) => {
       const liveItem: AlertItem = {
@@ -239,20 +330,32 @@ export default function App() {
         timestamp: new Date().toISOString(),
       };
       setAlerts((prev) => [liveItem, ...prev.filter((a) => a.alert_id !== liveItem.alert_id)]);
+      void fetchSystemStatus();
     };
 
+    const onSocketConnect = () => setSocketConnected(true);
+    const onSocketDisconnect = () => setSocketConnected(false);
+
     socket.on('new_alert', onNewAlert);
+    socket.on('connect', onSocketConnect);
+    socket.on('disconnect', onSocketDisconnect);
+    const statusInterval = window.setInterval(() => {
+      void fetchSystemStatus();
+    }, 15000);
 
     return () => {
       socket.off('new_alert', onNewAlert);
+      socket.off('connect', onSocketConnect);
+      socket.off('disconnect', onSocketDisconnect);
+      window.clearInterval(statusInterval);
     };
-  }, [fetchAlertsPage]);
+  }, [fetchAlertsPage, fetchSystemStatus]);
 
   useEffect(() => {
-    if (activeTab === 'daily' && !dailyLoadedOnce && !dailyLoading) {
-      void fetchDailySummary();
+    if (activeTab === 'daily' && !dailyLoading) {
+      void fetchDailySummary(dailyDays);
     }
-  }, [activeTab, dailyLoadedOnce, dailyLoading, fetchDailySummary]);
+  }, [activeTab, dailyDays, dailyLoading, fetchDailySummary]);
 
   useEffect(() => {
     if (!newCity.trim()) {
@@ -288,13 +391,66 @@ export default function App() {
   }, [activeTab, alertsCursor, alertsHasMore, alertsLoadingInitial, alertsLoadingMore, fetchAlertsPage]);
 
   const saveSettings = async () => {
+    setSaveFeedback(null);
+    if (webhookUrlError) {
+      setSaveFeedback({ type: 'error', text: webhookUrlError });
+      return;
+    }
+    if (!webhookUrl.trim()) {
+      setSaveFeedback({ type: 'warning', text: 'לא הוגדרה כתובת Webhook. ללא כתובת לא תתבצע שליחה.' });
+      return;
+    }
+    if (cities.length === 0) {
+      setSaveFeedback({ type: 'warning', text: 'לא נבחרו ערים לניטור. יש לבחור לפחות יישוב אחד.' });
+      return;
+    }
+
     setIsSaving(true);
-    await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cities, webhook_url: webhookUrl }),
-    });
-    setIsSaving(false);
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cities, webhook_url: webhookUrl }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSaveFeedback({ type: 'success', text: 'ההגדרות נשמרו בהצלחה.' });
+      void fetchSystemStatus();
+    } catch (err) {
+      console.error('Failed to save settings', err);
+      setSaveFeedback({ type: 'error', text: 'שמירת ההגדרות נכשלה. נסה שוב.' });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const testWebhook = async () => {
+    setTestFeedback(null);
+
+    if (webhookUrlError) {
+      setTestFeedback({ type: 'error', text: webhookUrlError });
+      return;
+    }
+    if (!webhookUrl.trim()) {
+      setTestFeedback({ type: 'warning', text: 'לפני בדיקה יש להגדיר כתובת Webhook.' });
+      return;
+    }
+
+    setIsTestingWebhook(true);
+    try {
+      const res = await fetch('/api/webhook/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ city: cities[0] || 'באר יעקב' }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload?.error || `HTTP ${res.status}`);
+      setTestFeedback({ type: 'success', text: 'בדיקת ה-Webhook נשלחה בהצלחה.' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'שגיאה לא ידועה';
+      setTestFeedback({ type: 'error', text: `בדיקת webhook נכשלה: ${msg}` });
+    } finally {
+      setIsTestingWebhook(false);
+    }
   };
 
   const addCity = (city: string) => {
@@ -303,6 +459,7 @@ export default function App() {
       setCities([...cities, normalized]);
       setNewCity('');
       setShowSuggestions(false);
+      setSaveFeedback(null);
     }
   };
 
@@ -315,6 +472,51 @@ export default function App() {
   };
 
   const groupedDaily = useMemo(() => dailySummary, [dailySummary]);
+
+  const filteredAlerts = useMemo(() => {
+    return alerts.filter((alert) => {
+      if (dashboardCategoryFilter !== 'all' && String(alert.data?.cat || '') !== dashboardCategoryFilter) {
+        return false;
+      }
+      if (dashboardCityFilter.trim()) {
+        const q = dashboardCityFilter.trim().toLowerCase();
+        const hasCity = (alert.data?.data || []).some((city) => city.toLowerCase().includes(q));
+        if (!hasCity) return false;
+      }
+      if (dashboardOnly24h) {
+        const d = parseTimestamp(alert.timestamp);
+        if (!d) return false;
+        if (Date.now() - d.getTime() > DAY_MS) return false;
+      }
+      return true;
+    });
+  }, [alerts, dashboardCategoryFilter, dashboardCityFilter, dashboardOnly24h]);
+
+  const categoryOptions = useMemo(() => {
+    const items = new Map<string, string>();
+    for (const alert of alerts) {
+      const cat = String(alert.data?.cat || '');
+      if (!cat) continue;
+      items.set(cat, alert.data?.title || alert.data?.categoryName || `קטגוריה ${cat}`);
+    }
+    return Array.from(items.entries()).map(([value, label]) => ({ value, label }));
+  }, [alerts]);
+
+  const dailyTrend = useMemo(() => {
+    const sorted = [...dailySummary].sort((a, b) => b.day.localeCompare(a.day));
+    const current = sorted.slice(0, 7).reduce((sum, item) => sum + item.missileCount, 0);
+    const previous = sorted.slice(7, 14).reduce((sum, item) => sum + item.missileCount, 0);
+    return current - previous;
+  }, [dailySummary]);
+
+  const feedbackClass = (type: FeedbackType) => {
+    if (type === 'success') return 'border-emerald-200 bg-emerald-50 text-emerald-800';
+    if (type === 'warning') return 'border-amber-200 bg-amber-50 text-amber-800';
+    return 'border-red-200 bg-red-50 text-red-800';
+  };
+
+  const latestCategory = String(systemStatus?.latestAlert?.category || '');
+  const hasActiveThreat = Boolean(latestCategory && latestCategory !== '10');
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 font-sans" dir="rtl">
@@ -358,40 +560,131 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+      <main className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {activeTab === 'dashboard' && (
           <div className="space-y-6">
-            <div className="flex items-center justify-between">
-              <h2 className="text-2xl font-bold tracking-tight">כל ההתראות</h2>
-              <div className="flex items-center gap-2 text-sm text-zinc-500">
-                <span className="relative flex h-3 w-3">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
-                </span>
-                מחובר לשרת
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className={`rounded-xl border p-4 ${hasActiveThreat ? 'border-red-200 bg-red-50' : 'border-emerald-200 bg-emerald-50'}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm font-medium">מצב נוכחי</div>
+                  {hasActiveThreat ? <Siren className="w-5 h-5 text-red-700" /> : <ShieldCheck className="w-5 h-5 text-emerald-700" />}
+                </div>
+                <div className={`mt-2 text-lg font-bold ${hasActiveThreat ? 'text-red-800' : 'text-emerald-800'}`}>
+                  {hasActiveThreat ? 'יש התרעה פעילה' : 'אין התרעה פעילה'}
+                </div>
+                <div className="mt-1 text-sm text-zinc-700">עודכן: {formatRelative(systemStatus?.poll?.lastPollAt || null)}</div>
               </div>
+              <div className="rounded-xl border border-zinc-200 bg-white p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm font-medium">בריאות מערכת</div>
+                  <button
+                    type="button"
+                    onClick={() => fetchSystemStatus()}
+                    className="text-xs px-2 py-1 border border-zinc-300 rounded-md hover:bg-zinc-100"
+                  >
+                    רענון
+                  </button>
+                </div>
+                <div className="mt-2 grid grid-cols-3 gap-2 text-sm">
+                  <div className="rounded-lg bg-zinc-50 border border-zinc-200 px-2 py-1.5 text-center">
+                    ערים
+                    <div className="font-semibold">{systemStatus?.monitoredCitiesCount ?? cities.length}</div>
+                  </div>
+                  <div className="rounded-lg bg-zinc-50 border border-zinc-200 px-2 py-1.5 text-center">
+                    cooldown
+                    <div className="font-semibold">{systemStatus?.activeCooldownCount ?? '-'}</div>
+                  </div>
+                  <div className="rounded-lg bg-zinc-50 border border-zinc-200 px-2 py-1.5 text-center">
+                    polling
+                    <div className={`font-semibold ${systemStatus?.poll?.ok === false ? 'text-red-700' : 'text-emerald-700'}`}>
+                      {systemStatus?.poll?.ok === false ? 'תקלה' : 'תקין'}
+                    </div>
+                  </div>
+                </div>
+                {systemStatus?.poll?.error && (
+                  <div className="mt-2 text-xs text-red-700">שגיאה: {systemStatus.poll.error}</div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <h2 className="text-2xl font-bold tracking-tight">כל ההתראות</h2>
+              <div className="flex items-center gap-2 text-sm">
+                {socketConnected ? <Wifi className="w-4 h-4 text-emerald-600" /> : <WifiOff className="w-4 h-4 text-red-600" />}
+                <span className={socketConnected ? 'text-emerald-700' : 'text-red-700'}>
+                  {socketConnected ? 'מחובר לשרת בזמן אמת' : 'מנותק מהשרת'}
+                </span>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl border border-zinc-200 p-3 sm:p-4 grid gap-2 sm:grid-cols-12">
+              <input
+                value={dashboardCityFilter}
+                onChange={(e) => setDashboardCityFilter(e.target.value)}
+                placeholder="סינון לפי עיר"
+                className="sm:col-span-4 px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none"
+              />
+              <select
+                value={dashboardCategoryFilter}
+                onChange={(e) => setDashboardCategoryFilter(e.target.value)}
+                className="sm:col-span-3 px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none bg-white"
+              >
+                <option value="all">כל הסוגים</option>
+                {categoryOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => setDashboardOnly24h((prev) => !prev)}
+                className={`sm:col-span-2 px-3 py-2 rounded-lg border transition-colors ${
+                  dashboardOnly24h ? 'bg-zinc-900 text-white border-zinc-900' : 'bg-white border-zinc-300 hover:bg-zinc-100'
+                }`}
+              >
+                24 שעות
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setDashboardCityFilter('');
+                  setDashboardCategoryFilter('all');
+                  setDashboardOnly24h(false);
+                }}
+                className="sm:col-span-1 px-3 py-2 rounded-lg border border-zinc-300 bg-white hover:bg-zinc-100"
+              >
+                נקה
+              </button>
+              <button
+                type="button"
+                onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+                className="sm:col-span-2 px-3 py-2 rounded-lg border border-zinc-300 bg-white hover:bg-zinc-100"
+              >
+                חדש ביותר
+              </button>
             </div>
 
             {alertsLoadingInitial && alerts.length === 0 ? (
               <div className="text-center py-12 bg-white rounded-xl border border-zinc-200">
                 טוען התראות...
               </div>
-            ) : alerts.length === 0 ? (
+            ) : filteredAlerts.length === 0 ? (
               <div className="text-center py-12 bg-white rounded-xl border border-zinc-200">
                 <CheckCircle className="w-12 h-12 text-emerald-500 mx-auto mb-4" />
-                <h3 className="text-lg font-medium">אין התרעות פעילות</h3>
-                <p className="text-zinc-500 mt-1">המערכת מנטרת התרעות בזמן אמת</p>
+                <h3 className="text-lg font-medium">לא נמצאו התראות לתצוגה</h3>
+                <p className="text-zinc-500 mt-1">נסה לעדכן את הסינון או להמתין לעדכון הבא</p>
               </div>
             ) : (
               <div className="grid gap-4">
-                {alerts.map((alert, i) => (
+                {filteredAlerts.map((alert, i) => (
                   <div key={`${alert.alert_id || alert.id || i}`} className="bg-white p-5 rounded-xl border border-zinc-200 shadow-sm flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
                     <div>
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${
                           alert.data?.cat === '10' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
                         }`}>
-                          {alert.data?.categoryName || alert.data?.title || 'התרעה'}
+                          {alert.data?.title || alert.data?.categoryName || 'התרעה'}
                         </span>
                         <span className="text-sm text-zinc-500">{formatAlertTimestamp(alert.timestamp)}</span>
                       </div>
@@ -404,7 +697,7 @@ export default function App() {
                 {alertsLoadingMore && (
                   <div className="text-center text-sm text-zinc-500 py-3">טוען עוד התראות...</div>
                 )}
-                {!alertsHasMore && alerts.length > 0 && (
+                {!alertsHasMore && filteredAlerts.length > 0 && (
                   <div className="text-center text-sm text-zinc-400 py-2">הגעת לסוף הרשימה</div>
                 )}
               </div>
@@ -414,14 +707,34 @@ export default function App() {
 
         {activeTab === 'daily' && (
           <div className="space-y-6">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between flex-wrap gap-2">
               <h2 className="text-2xl font-bold tracking-tight">סיכום יומי - ירי רקטות וטילים (איחוד 10 דקות)</h2>
-              <button
-                onClick={() => fetchDailySummary()}
-                className="px-3 py-2 rounded-md border border-zinc-300 text-sm hover:bg-zinc-100 transition-colors"
-              >
-                רענון
-              </button>
+              <div className="flex items-center gap-2">
+                {[7, 30, 90].map((days) => (
+                  <button
+                    key={days}
+                    type="button"
+                    onClick={() => setDailyDays(days)}
+                    className={`px-3 py-2 rounded-md border text-sm transition-colors ${
+                      dailyDays === days ? 'bg-zinc-900 text-white border-zinc-900' : 'border-zinc-300 hover:bg-zinc-100'
+                    }`}
+                  >
+                    {days} ימים
+                  </button>
+                ))}
+                <button
+                  onClick={() => fetchDailySummary(dailyDays)}
+                  className="px-3 py-2 rounded-md border border-zinc-300 text-sm hover:bg-zinc-100 transition-colors"
+                >
+                  רענון
+                </button>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl border border-zinc-200 p-4 text-sm text-zinc-700">
+              מגמה שבועית: <b className={dailyTrend > 0 ? 'text-red-700' : dailyTrend < 0 ? 'text-emerald-700' : 'text-zinc-700'}>
+                {dailyTrend > 0 ? '+' : ''}{dailyTrend}
+              </b> מול 7 הימים הקודמים.
             </div>
 
             {dailyLoading && groupedDaily.length === 0 ? (
@@ -488,7 +801,7 @@ export default function App() {
                               <span className={`px-2 py-0.5 rounded-full ${
                                 alert.data?.cat === '10' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
                               }`}>
-                                {alert.data?.categoryName || alert.data?.title || 'התרעה'}
+                                {alert.data?.title || alert.data?.categoryName || 'התרעה'}
                               </span>
                               <span className="text-zinc-500">{formatAlertTimestamp(alert.timestamp)}</span>
                             </div>
@@ -527,6 +840,23 @@ export default function App() {
               <h2 className="text-2xl font-bold tracking-tight mb-6">הגדרות מערכת</h2>
 
               <div className="bg-white p-6 rounded-xl border border-zinc-200 shadow-sm space-y-6">
+                <div className="grid gap-2 sm:grid-cols-3 text-sm">
+                  <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 text-center">
+                    webhook
+                    <div className={`font-semibold ${systemStatus?.webhookConfigured ? 'text-emerald-700' : 'text-red-700'}`}>
+                      {systemStatus?.webhookConfigured ? 'מוגדר' : 'לא מוגדר'}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 text-center">
+                    ערים מנוטרות
+                    <div className="font-semibold">{systemStatus?.monitoredCitiesCount ?? cities.length}</div>
+                  </div>
+                  <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 text-center">
+                    polling אחרון
+                    <div className="font-semibold">{formatRelative(systemStatus?.poll?.lastPollAt || null)}</div>
+                  </div>
+                </div>
+
                 <div>
                   <label className="block text-sm font-medium text-zinc-700 mb-2">כתובת Webhook</label>
                   <p className="text-sm text-zinc-500 mb-3">
@@ -535,12 +865,47 @@ export default function App() {
                   <input
                     type="url"
                     value={webhookUrl}
-                    onChange={(e) => setWebhookUrl(e.target.value)}
+                    onChange={(e) => {
+                      setWebhookUrl(e.target.value);
+                      setSaveFeedback(null);
+                      setTestFeedback(null);
+                    }}
                     placeholder="https://your-webhook-url.com/endpoint"
-                    className="w-full px-4 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none transition-all text-left"
+                    className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none transition-all text-left ${
+                      webhookUrlError ? 'border-red-400' : 'border-zinc-300'
+                    }`}
                     dir="ltr"
                   />
+                  {webhookUrlError && (
+                    <p className="text-sm text-red-700 mt-2">{webhookUrlError}</p>
+                  )}
                 </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={testWebhook}
+                    disabled={isTestingWebhook}
+                    className="px-4 py-2 rounded-lg border border-zinc-300 bg-white hover:bg-zinc-100 disabled:opacity-50 transition-colors text-sm font-medium inline-flex items-center gap-2"
+                  >
+                    {isTestingWebhook ? <Loader2 className="w-4 h-4 animate-spin" /> : <TestTube2 className="w-4 h-4" />}
+                    בדיקת Webhook עכשיו
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => fetchSystemStatus()}
+                    className="px-4 py-2 rounded-lg border border-zinc-300 bg-white hover:bg-zinc-100 transition-colors text-sm inline-flex items-center gap-2"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    רענון סטטוס
+                  </button>
+                </div>
+
+                {testFeedback && (
+                  <div className={`border rounded-lg px-3 py-2 text-sm ${feedbackClass(testFeedback.type)}`}>
+                    {testFeedback.text}
+                  </div>
+                )}
 
                 <hr className="border-zinc-200" />
 
@@ -607,7 +972,13 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="pt-4">
+                {saveFeedback && (
+                  <div className={`border rounded-lg px-3 py-2 text-sm ${feedbackClass(saveFeedback.type)}`}>
+                    {saveFeedback.text}
+                  </div>
+                )}
+
+                <div className="pt-4 flex items-center gap-2 flex-wrap">
                   <button
                     onClick={saveSettings}
                     disabled={isSaving}
