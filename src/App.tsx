@@ -21,6 +21,10 @@ import { ISRAEL_CITIES } from './constants/cities';
 const socket = io();
 const ALERTS_PAGE_SIZE = 50;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const FILTERED_ALERT_DESC_SNIPPETS = [
+  'ניתן לצאת מהמרחב המוגן אך יש להישאר בקרבתו',
+  'בדקות הקרובות צפויות להתקבל התרעות באזורך',
+];
 
 type TabKey = 'dashboard' | 'daily' | 'settings';
 
@@ -137,6 +141,12 @@ function isValidWebhookUrl(value: string) {
   } catch {
     return false;
   }
+}
+
+function shouldFilterByDesc(desc: string | undefined) {
+  const normalized = (desc || '').trim();
+  if (!normalized) return false;
+  return FILTERED_ALERT_DESC_SNIPPETS.some((snippet) => normalized.includes(snippet));
 }
 
 export default function App() {
@@ -475,6 +485,10 @@ export default function App() {
 
   const filteredAlerts = useMemo(() => {
     return alerts.filter((alert) => {
+      if (shouldFilterByDesc(alert.data?.desc)) {
+        return false;
+      }
+
       if (dashboardCategoryFilter !== 'all' && String(alert.data?.cat || '') !== dashboardCategoryFilter) {
         return false;
       }
@@ -495,12 +509,18 @@ export default function App() {
   const categoryOptions = useMemo(() => {
     const items = new Map<string, string>();
     for (const alert of alerts) {
+      if (shouldFilterByDesc(alert.data?.desc)) continue;
       const cat = String(alert.data?.cat || '');
       if (!cat) continue;
       items.set(cat, alert.data?.title || alert.data?.categoryName || `קטגוריה ${cat}`);
     }
     return Array.from(items.entries()).map(([value, label]) => ({ value, label }));
   }, [alerts]);
+
+  const visibleSelectedCityAlerts = useMemo(
+    () => selectedCityAlerts.filter((alert) => !shouldFilterByDesc(alert.data?.desc)),
+    [selectedCityAlerts]
+  );
 
   const dailyTrend = useMemo(() => {
     const sorted = [...dailySummary].sort((a, b) => b.day.localeCompare(a.day));
@@ -789,13 +809,13 @@ export default function App() {
                       </button>
                     </div>
 
-                    {selectedCityAlertsLoading && selectedCityAlerts.length === 0 ? (
+                    {selectedCityAlertsLoading && visibleSelectedCityAlerts.length === 0 ? (
                       <p className="text-sm text-zinc-500">טוען התראות לעיר...</p>
-                    ) : selectedCityAlerts.length === 0 ? (
+                    ) : visibleSelectedCityAlerts.length === 0 ? (
                       <p className="text-sm text-zinc-500">לא נמצאו התראות לעיר זו.</p>
                     ) : (
                       <div className="space-y-2">
-                        {selectedCityAlerts.map((alert, i) => (
+                        {visibleSelectedCityAlerts.map((alert, i) => (
                           <div key={`${alert.alert_id || alert.id || i}`} className="border border-zinc-200 rounded-lg p-3 bg-zinc-50">
                             <div className="flex items-center gap-2 text-xs mb-1 flex-wrap">
                               <span className={`px-2 py-0.5 rounded-full ${
