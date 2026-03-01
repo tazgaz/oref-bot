@@ -21,10 +21,10 @@ import { ISRAEL_CITIES } from './constants/cities';
 const socket = io();
 const ALERTS_PAGE_SIZE = 50;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const FILTERED_ALERT_DESC_SNIPPETS = [
-  'ניתן לצאת מהמרחב המוגן אך יש להישאר בקרבתו',
-  'בדקות הקרובות צפויות להתקבל התרעות באזורך',
+const FILTERED_ALERT_PATTERNS = [
+  /ניתן\s+לצאת\s+מהמרחב\s+המוגן\s+אך\s+יש\s+להישאר\s+בקרבתו/i,
 ];
+const PREWARNING_ALERT_PATTERN = /בדקות\s+הקרובות\s+צפויות?\s+להתקבל\s+התרעות?\s+בא[י]?זורך/i;
 
 type TabKey = 'dashboard' | 'daily' | 'settings';
 
@@ -143,10 +143,23 @@ function isValidWebhookUrl(value: string) {
   }
 }
 
-function shouldFilterByDesc(desc: string | undefined) {
-  const normalized = (desc || '').trim();
-  if (!normalized) return false;
-  return FILTERED_ALERT_DESC_SNIPPETS.some((snippet) => normalized.includes(snippet));
+function normalizeAlertText(value: string | undefined) {
+  return (value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function shouldFilterAlert(desc: string | undefined, title: string | undefined) {
+  const combined = `${normalizeAlertText(title)} ${normalizeAlertText(desc)}`.trim();
+  if (!combined) return false;
+  return FILTERED_ALERT_PATTERNS.some((pattern) => pattern.test(combined));
+}
+
+function isPrewarningAlert(desc: string | undefined, title: string | undefined) {
+  const combined = `${normalizeAlertText(title)} ${normalizeAlertText(desc)}`.trim();
+  if (!combined) return false;
+  return PREWARNING_ALERT_PATTERN.test(combined);
 }
 
 export default function App() {
@@ -158,6 +171,7 @@ export default function App() {
   const [alertsLoadingMore, setAlertsLoadingMore] = useState(false);
   const [dashboardCityFilter, setDashboardCityFilter] = useState('');
   const [dashboardCategoryFilter, setDashboardCategoryFilter] = useState('all');
+  const [dashboardPrewarningFilter, setDashboardPrewarningFilter] = useState<'all' | 'only' | 'hide'>('all');
   const [dashboardOnly24h, setDashboardOnly24h] = useState(false);
   const [socketConnected, setSocketConnected] = useState(socket.connected);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
@@ -485,7 +499,15 @@ export default function App() {
 
   const filteredAlerts = useMemo(() => {
     return alerts.filter((alert) => {
-      if (shouldFilterByDesc(alert.data?.desc)) {
+      if (shouldFilterAlert(alert.data?.desc, alert.data?.title)) {
+        return false;
+      }
+
+      const isPrewarning = isPrewarningAlert(alert.data?.desc, alert.data?.title);
+      if (dashboardPrewarningFilter === 'only' && !isPrewarning) {
+        return false;
+      }
+      if (dashboardPrewarningFilter === 'hide' && isPrewarning) {
         return false;
       }
 
@@ -504,12 +526,12 @@ export default function App() {
       }
       return true;
     });
-  }, [alerts, dashboardCategoryFilter, dashboardCityFilter, dashboardOnly24h]);
+  }, [alerts, dashboardCategoryFilter, dashboardCityFilter, dashboardOnly24h, dashboardPrewarningFilter]);
 
   const categoryOptions = useMemo(() => {
     const items = new Map<string, string>();
     for (const alert of alerts) {
-      if (shouldFilterByDesc(alert.data?.desc)) continue;
+      if (shouldFilterAlert(alert.data?.desc, alert.data?.title)) continue;
       const cat = String(alert.data?.cat || '');
       if (!cat) continue;
       items.set(cat, alert.data?.title || alert.data?.categoryName || `קטגוריה ${cat}`);
@@ -518,7 +540,7 @@ export default function App() {
   }, [alerts]);
 
   const visibleSelectedCityAlerts = useMemo(
-    () => selectedCityAlerts.filter((alert) => !shouldFilterByDesc(alert.data?.desc)),
+    () => selectedCityAlerts.filter((alert) => !shouldFilterAlert(alert.data?.desc, alert.data?.title)),
     [selectedCityAlerts]
   );
 
@@ -642,7 +664,7 @@ export default function App() {
                 value={dashboardCityFilter}
                 onChange={(e) => setDashboardCityFilter(e.target.value)}
                 placeholder="סינון לפי עיר"
-                className="sm:col-span-4 px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none"
+                className="sm:col-span-3 px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none"
               />
               <select
                 value={dashboardCategoryFilter}
@@ -655,6 +677,15 @@ export default function App() {
                     {option.label}
                   </option>
                 ))}
+              </select>
+              <select
+                value={dashboardPrewarningFilter}
+                onChange={(e) => setDashboardPrewarningFilter(e.target.value as 'all' | 'only' | 'hide')}
+                className="sm:col-span-3 px-3 py-2 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-zinc-900 focus:border-zinc-900 outline-none bg-white"
+              >
+                <option value="all">הודעות בדקות הקרובות: הכל</option>
+                <option value="only">רק בדקות הקרובות</option>
+                <option value="hide">הסתר בדקות הקרובות</option>
               </select>
               <button
                 type="button"
@@ -670,18 +701,12 @@ export default function App() {
                 onClick={() => {
                   setDashboardCityFilter('');
                   setDashboardCategoryFilter('all');
+                  setDashboardPrewarningFilter('all');
                   setDashboardOnly24h(false);
                 }}
                 className="sm:col-span-1 px-3 py-2 rounded-lg border border-zinc-300 bg-white hover:bg-zinc-100"
               >
                 נקה
-              </button>
-              <button
-                type="button"
-                onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
-                className="sm:col-span-2 px-3 py-2 rounded-lg border border-zinc-300 bg-white hover:bg-zinc-100"
-              >
-                חדש ביותר
               </button>
             </div>
 
