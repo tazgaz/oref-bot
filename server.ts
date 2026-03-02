@@ -20,7 +20,13 @@ let lastPollAt: string | null = null;
 let lastPollOk = true;
 let lastPollStatusCode: number | null = null;
 let lastPollError: string | null = null;
-const cityLastWebhookAt = new Map<string, { lastSentAtMs: number; cooldownMs: number; reason: 'DEFAULT' | 'ALL_CLEAR' }>();
+const cityLastWebhookAt = new Map<string, {
+  lastSentAtMs: number;
+  cooldownMs: number;
+  reason: 'DEFAULT' | 'ALL_CLEAR';
+  lastType: 'THREAT' | 'ALL_CLEAR';
+  lastCategory: string;
+}>();
 
 app.use(express.json());
 
@@ -569,6 +575,7 @@ function handleAlerts(alertData: any) {
       const nowMs = Date.now();
       const citiesToSend: string[] = [];
       const cooldownSkippedCities: string[] = [];
+      const allClearPreconditionSkippedCities: string[] = [];
       const seenKeys = new Set<string>();
 
       for (const city of matchedCities) {
@@ -577,6 +584,17 @@ function handleAlerts(alertData: any) {
         seenKeys.add(key);
 
         const cooldownEntry = cityLastWebhookAt.get(key);
+
+        if (isAllClear) {
+          const hadPreviousMissileThreat =
+            cooldownEntry?.lastType === 'THREAT' &&
+            String(cooldownEntry?.lastCategory || '') === '1';
+          if (!hadPreviousMissileThreat) {
+            allClearPreconditionSkippedCities.push(city);
+            continue;
+          }
+        }
+
         const lastSentAt = cooldownEntry?.lastSentAtMs || 0;
         const activeCooldownMs = cooldownEntry?.cooldownMs || CITY_WEBHOOK_COOLDOWN_MS;
         if (nowMs - lastSentAt < activeCooldownMs) {
@@ -588,6 +606,16 @@ function handleAlerts(alertData: any) {
       }
 
       if (citiesToSend.length === 0) {
+        if (isAllClear && allClearPreconditionSkippedCities.length > 0) {
+          void writeWebhookLog({
+            time: new Date().toISOString(),
+            status: 'SKIPPED_ALL_CLEAR_NO_PREVIOUS_MISSILE_THREAT',
+            alertId,
+            skippedCities: allClearPreconditionSkippedCities.slice(0, 20)
+          });
+          return;
+        }
+
         void writeWebhookLog({
           time: new Date().toISOString(),
           status: 'SKIPPED_CITY_COOLDOWN',
@@ -602,7 +630,9 @@ function handleAlerts(alertData: any) {
         cityLastWebhookAt.set(cooldownCityKey(city), {
           lastSentAtMs: nowMs,
           cooldownMs: cooldownMsForAlert,
-          reason: isAllClear ? 'ALL_CLEAR' : 'DEFAULT'
+          reason: isAllClear ? 'ALL_CLEAR' : 'DEFAULT',
+          lastType: isAllClear ? 'ALL_CLEAR' : 'THREAT',
+          lastCategory: String(category || '')
         });
       }
 
@@ -614,6 +644,16 @@ function handleAlerts(alertData: any) {
           cooldownMs: cooldownMsForAlert,
           sentCities: citiesToSend.slice(0, 20),
           skippedCities: cooldownSkippedCities.slice(0, 20)
+        });
+      }
+
+      if (isAllClear && allClearPreconditionSkippedCities.length > 0) {
+        void writeWebhookLog({
+          time: new Date().toISOString(),
+          status: 'PARTIAL_ALL_CLEAR_NO_PREVIOUS_MISSILE_THREAT',
+          alertId,
+          sentCities: citiesToSend.slice(0, 20),
+          skippedCities: allClearPreconditionSkippedCities.slice(0, 20)
         });
       }
       
