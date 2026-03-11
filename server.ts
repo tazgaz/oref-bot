@@ -539,12 +539,20 @@ function handleAlerts(alertData: any) {
 
     const monitoredCityList = monitoredCities
       .filter((c: unknown): c is string => typeof c === 'string')
-      .map((c: string) => normalizeCityName(c))
-      .filter(Boolean);
+      .map((c: string) => ({
+        original: c.trim(),
+        normalized: normalizeCityName(c)
+      }))
+      .filter((c: { original: string; normalized: string }) => c.original.length > 0 && c.normalized.length > 0);
 
-    const matchedCities = cities.filter((alertCity: string) =>
-      monitoredCityList.some((monitoredCity: string) => isCityMatch(monitoredCity, alertCity))
+    const matchedAlertCities = cities.filter((alertCity: string) =>
+      monitoredCityList.some((monitoredCity: { normalized: string }) => isCityMatch(monitoredCity.normalized, alertCity))
     );
+    const matchedMonitoredCities = monitoredCityList
+      .filter((monitoredCity: { normalized: string }) =>
+        cities.some((alertCity: string) => isCityMatch(monitoredCity.normalized, alertCity))
+      )
+      .map((monitoredCity: { original: string }) => monitoredCity.original);
 
     if (!webhookUrl) {
       void writeWebhookLog({
@@ -552,12 +560,12 @@ function handleAlerts(alertData: any) {
         status: 'SKIPPED_NO_WEBHOOK_URL',
         alertId,
         monitoredCitiesCount: monitoredCities.length,
-        matchedCitiesCount: matchedCities.length
+        matchedCitiesCount: matchedMonitoredCities.length
       });
       return;
     }
 
-    if (matchedCities.length === 0) {
+    if (matchedMonitoredCities.length === 0) {
       void writeWebhookLog({
         time: new Date().toISOString(),
         status: 'SKIPPED_NO_CITY_MATCH',
@@ -569,7 +577,7 @@ function handleAlerts(alertData: any) {
       return;
     }
 
-    if (matchedCities.length > 0 && webhookUrl) {
+    if (matchedMonitoredCities.length > 0 && webhookUrl) {
       const isAllClear = category === "10";
       const cooldownMsForAlert = isAllClear ? ALL_CLEAR_CITY_WEBHOOK_COOLDOWN_MS : CITY_WEBHOOK_COOLDOWN_MS;
       const nowMs = Date.now();
@@ -578,7 +586,7 @@ function handleAlerts(alertData: any) {
       const allClearPreconditionSkippedCities: string[] = [];
       const seenKeys = new Set<string>();
 
-      for (const city of matchedCities) {
+      for (const city of matchedMonitoredCities) {
         const key = cooldownCityKey(city);
         if (!key || seenKeys.has(key)) continue;
         seenKeys.add(key);
@@ -621,7 +629,7 @@ function handleAlerts(alertData: any) {
           status: 'SKIPPED_CITY_COOLDOWN',
           alertId,
           cooldownMs: cooldownMsForAlert,
-          matchedCities: matchedCities.slice(0, 20)
+          matchedCities: matchedMonitoredCities.slice(0, 20)
         });
         return;
       }
@@ -664,7 +672,11 @@ function handleAlerts(alertData: any) {
           categoryName: categoryName,
           title: alertData.title,
           city,
-          cities: [city],
+          // Always include all matched monitored cities in payload, even when some are in cooldown.
+          cities: matchedMonitoredCities,
+          sentCities: citiesToSend,
+          skippedCities: cooldownSkippedCities,
+          matchedAlertCities: matchedAlertCities.slice(0, 50),
           desc: alertData.desc,
           time: new Date().toISOString()
         });
