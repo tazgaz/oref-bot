@@ -337,10 +337,10 @@ export default function App() {
   }, [fetchAlertsPage, fetchSystemStatus]);
 
   useEffect(() => {
-    if (activeTab === 'daily' && !dailyLoading) {
+    if (activeTab === 'daily') {
       void fetchDailySummary(dailyDays);
     }
-  }, [activeTab, dailyDays, dailyLoading, fetchDailySummary]);
+  }, [activeTab, dailyDays, fetchDailySummary]);
 
   useEffect(() => {
     if (!newCity.trim()) {
