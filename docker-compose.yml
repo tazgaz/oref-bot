@@ -17,6 +17,15 @@ services:
       - oref_data:/data
       - ./logs:/logs
     restart: unless-stopped
+  db-admin:
+    image: coleifer/sqlite-web:latest
+    container_name: oref-db-admin
+    command: ["sqlite_web", "/data/alerts.db", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8088:8080"
+    volumes:
+      - oref_data:/data
+    restart: unless-stopped
 
 volumes:
   oref_data:
