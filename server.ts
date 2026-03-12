@@ -191,153 +191,117 @@ app.get('/api/alerts/history', (req, res) => {
   });
 });
 
-app.get('/api/alerts/daily-summary', async (req, res) => {
+app.get('/api/alerts/daily-summary', (req, res) => {
   const MERGE_WINDOW_MS = 10 * 60 * 1000;
   const MISSILE_CATEGORY = '1';
   const rawDays = Number(req.query.days);
   const days = Number.isFinite(rawDays) ? Math.min(Math.max(rawDays, 1), 365) : 30;
+  const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get() as any;
+  const monitoredCities = JSON.parse(settings.cities || '[]');
+  const monitoredCityList = (Array.isArray(monitoredCities) ? monitoredCities : [])
+    .filter((c: unknown): c is string => typeof c === 'string')
+    .map((c: string) => normalizeCityName(c))
+    .filter(Boolean);
+  const rows = db.prepare('SELECT * FROM alerts ORDER BY id DESC').all() as any[];
   const now = new Date();
-  const fromMs = now.getTime() - days * 24 * 60 * 60 * 1000;
+  const from = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
 
-  const parseOrefDateToMs = (value: string) => {
-    const orefMatch = value.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
-    if (orefMatch) {
-      const [, y, m, d, hh, mm, ss] = orefMatch;
-      return new Date(Number(y), Number(m) - 1, Number(d), Number(hh), Number(mm), Number(ss)).getTime();
+  const dailyMap = new Map<string, {
+    day: string;
+    cityTimestamps: Map<string, number[]>;
+  }>();
+
+  const toTimestampMs = (value: string) => {
+    const localDbMatch = value.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+    if (localDbMatch) {
+      const [, y, m, d, hh, mm, ss] = localDbMatch;
+      return new Date(`${y}-${m}-${d}T${hh}:${mm}:${ss}+02:00`).getTime();
     }
     return new Date(value).getTime();
   };
 
-  const toCityList = (value: unknown) => {
-    if (Array.isArray(value)) {
-      return value.filter((c: unknown): c is string => typeof c === 'string');
+  for (const row of rows) {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(row.data);
+    } catch {
+      continue;
     }
-    if (typeof value !== 'string') {
-      return [];
+
+    if (String(parsed?.cat || '') !== MISSILE_CATEGORY) {
+      continue;
     }
-    return value
-      .split(',')
-      .map((c) => c.trim())
-      .filter(Boolean);
-  };
 
-  try {
-    const response = await fetch('https://www.oref.org.il/warningMessages/alert/History/AlertsHistory.json', {
-      headers: {
-        'Referer': 'https://www.oref.org.il/',
-        'X-Requested-With': 'XMLHttpRequest',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/javascript, */*; q=0.01'
-      }
-    });
+    const cities = Array.isArray(parsed?.data) ? parsed.data.filter((c: unknown): c is string => typeof c === 'string') : [];
+    const ts = String(row.timestamp || '');
+    const tsMs = toTimestampMs(ts);
+    if (!Number.isFinite(tsMs)) continue;
+    const tsDate = new Date(tsMs);
+    if (tsDate < from) continue;
+    const day = tsDate.toISOString().slice(0, 10);
 
-    if (!response.ok) {
-      res.status(502).json({
-        error: 'Failed to fetch daily summary from Pikud HaOref',
-        status: response.status
+    const matchedMonitoredCities = cities
+      .map((alertCity: string) => monitoredCityList.find((monitoredCity: string) => isCityMatch(monitoredCity, alertCity)) || null)
+      .filter((city: string | null): city is string => Boolean(city));
+    const uniqueMatchedMonitoredCities: string[] = Array.from(new Set<string>(matchedMonitoredCities));
+
+    if (uniqueMatchedMonitoredCities.length === 0) {
+      continue;
+    }
+
+    if (!dailyMap.has(day)) {
+      dailyMap.set(day, {
+        day,
+        cityTimestamps: new Map()
       });
-      return;
     }
 
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      const rawText = await response.text();
-      console.error('Received non-JSON history payload from Pikud HaOref:', rawText.slice(0, 120));
-      res.status(502).json({ error: 'Invalid daily summary payload from Pikud HaOref' });
-      return;
+    const dayEntry = dailyMap.get(day)!;
+    for (const city of uniqueMatchedMonitoredCities) {
+      if (!dayEntry.cityTimestamps.has(city)) {
+        dayEntry.cityTimestamps.set(city, []);
+      }
+      dayEntry.cityTimestamps.get(city)!.push(tsMs);
     }
-
-    const history = await response.json() as Array<{
-      alertDate?: string;
-      category?: number | string;
-      data?: unknown;
-    }>;
-
-    const dailyMap = new Map<string, {
-      day: string;
-      cityTimestamps: Map<string, number[]>;
-    }>();
-
-    for (const item of Array.isArray(history) ? history : []) {
-      if (String(item?.category ?? '') !== MISSILE_CATEGORY) {
-        continue;
-      }
-
-      const tsMs = parseOrefDateToMs(String(item?.alertDate || ''));
-      if (!Number.isFinite(tsMs) || tsMs < fromMs) {
-        continue;
-      }
-
-      const day = new Date(tsMs).toISOString().slice(0, 10);
-      const uniqueAlertCities = Array.from(new Set(
-        toCityList(item?.data)
-          .map((city) => normalizeCityName(city))
-          .filter(Boolean)
-      ));
-
-      if (uniqueAlertCities.length === 0) {
-        continue;
-      }
-
-      if (!dailyMap.has(day)) {
-        dailyMap.set(day, {
-          day,
-          cityTimestamps: new Map()
-        });
-      }
-
-      const dayEntry = dailyMap.get(day)!;
-      for (const city of uniqueAlertCities) {
-        if (!dayEntry.cityTimestamps.has(city)) {
-          dayEntry.cityTimestamps.set(city, []);
-        }
-        dayEntry.cityTimestamps.get(city)!.push(tsMs);
-      }
-    }
-
-    const daysSummary = Array.from(dailyMap.values())
-      .sort((a, b) => b.day.localeCompare(a.day))
-      .map((dayEntry) => {
-        const cities = Array.from(dayEntry.cityTimestamps.entries()).map(([city, timestamps]) => {
-          const sorted = [...timestamps].sort((a, b) => a - b);
-          let mergedCount = 0;
-          let lastTs = -Infinity;
-          for (const t of sorted) {
-            if (t - lastTs >= MERGE_WINDOW_MS) {
-              mergedCount += 1;
-            }
-            lastTs = t;
-          }
-          return {
-            city,
-            alertsCount: mergedCount,
-            missileCount: mergedCount
-          };
-        }).sort((a, b) => b.missileCount - a.missileCount || b.alertsCount - a.alertsCount || a.city.localeCompare(b.city));
-
-        const totalMerged = cities.reduce((sum, c) => sum + c.missileCount, 0);
-        return {
-          day: dayEntry.day,
-          category: MISSILE_CATEGORY,
-          categoryName: CATEGORY_MAP[MISSILE_CATEGORY] || 'Missiles and rockets',
-          mergeWindowMinutes: 10,
-          alertsCount: totalMerged,
-          missileCount: totalMerged,
-          cities
-        };
-      });
-
-    res.json({
-      days,
-      generatedAt: new Date().toISOString(),
-      items: daysSummary
-    });
-  } catch (error) {
-    console.error('Failed to build daily summary from Pikud HaOref history:', error);
-    res.status(502).json({
-      error: 'Failed to fetch daily summary from Pikud HaOref'
-    });
   }
+
+  const daysSummary = Array.from(dailyMap.values())
+    .sort((a, b) => b.day.localeCompare(a.day))
+    .map((dayEntry) => {
+      const cities = Array.from(dayEntry.cityTimestamps.entries()).map(([city, timestamps]) => {
+        const sorted = [...timestamps].sort((a, b) => a - b);
+        let mergedCount = 0;
+        let lastTs = -Infinity;
+        for (const t of sorted) {
+          if (t - lastTs >= MERGE_WINDOW_MS) {
+            mergedCount += 1;
+          }
+          lastTs = t;
+        }
+        return {
+          city,
+          alertsCount: mergedCount,
+          missileCount: mergedCount
+        };
+      }).sort((a, b) => b.missileCount - a.missileCount || b.alertsCount - a.alertsCount || a.city.localeCompare(b.city));
+
+      const totalMerged = cities.reduce((sum, c) => sum + c.missileCount, 0);
+      return {
+        day: dayEntry.day,
+        category: MISSILE_CATEGORY,
+        categoryName: CATEGORY_MAP[MISSILE_CATEGORY] || 'Missiles and rockets',
+        mergeWindowMinutes: 10,
+        alertsCount: totalMerged,
+        missileCount: totalMerged,
+        cities
+      };
+    });
+
+  res.json({
+    days,
+    generatedAt: new Date().toISOString(),
+    items: daysSummary
+  });
 });
 
 app.get('/api/alerts/by-city', (req, res) => {
