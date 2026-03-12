@@ -196,12 +196,6 @@ app.get('/api/alerts/daily-summary', async (req, res) => {
   const MISSILE_CATEGORY = '1';
   const rawDays = Number(req.query.days);
   const days = Number.isFinite(rawDays) ? Math.min(Math.max(rawDays, 1), 365) : 30;
-  const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get() as any;
-  const monitoredCities = JSON.parse(settings.cities || '[]');
-  const monitoredCityList = (Array.isArray(monitoredCities) ? monitoredCities : [])
-    .filter((c: unknown): c is string => typeof c === 'string')
-    .map((c: string) => normalizeCityName(c))
-    .filter(Boolean);
   const now = new Date();
   const fromMs = now.getTime() - days * 24 * 60 * 60 * 1000;
 
@@ -275,14 +269,13 @@ app.get('/api/alerts/daily-summary', async (req, res) => {
       }
 
       const day = new Date(tsMs).toISOString().slice(0, 10);
-      const cities = toCityList(item?.data);
+      const uniqueAlertCities = Array.from(new Set(
+        toCityList(item?.data)
+          .map((city) => normalizeCityName(city))
+          .filter(Boolean)
+      ));
 
-      const matchedMonitoredCities = cities
-        .map((alertCity: string) => monitoredCityList.find((monitoredCity: string) => isCityMatch(monitoredCity, alertCity)) || null)
-        .filter((city: string | null): city is string => Boolean(city));
-      const uniqueMatchedMonitoredCities = Array.from(new Set(matchedMonitoredCities));
-
-      if (uniqueMatchedMonitoredCities.length === 0) {
+      if (uniqueAlertCities.length === 0) {
         continue;
       }
 
@@ -294,7 +287,7 @@ app.get('/api/alerts/daily-summary', async (req, res) => {
       }
 
       const dayEntry = dailyMap.get(day)!;
-      for (const city of uniqueMatchedMonitoredCities) {
+      for (const city of uniqueAlertCities) {
         if (!dayEntry.cityTimestamps.has(city)) {
           dayEntry.cityTimestamps.set(city, []);
         }
