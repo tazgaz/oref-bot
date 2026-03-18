@@ -609,7 +609,11 @@ out geom;
       body: `data=${encodeURIComponent(query)}`
     });
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '');
+      console.error('Overpass non-OK response:', response.status, errBody.slice(0, 200));
+      return null;
+    }
     const payload = await response.json() as any;
     const elements = Array.isArray(payload?.elements) ? payload.elements : [];
 
