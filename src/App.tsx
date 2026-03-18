@@ -69,6 +69,17 @@ type SystemStatus = {
   } | null;
 };
 
+type GeoPoint = [number, number];
+type PolygonCoordinates = GeoPoint[][];
+type MultiPolygonCoordinates = GeoPoint[][][];
+type CityPolygonItem = {
+  city: string;
+  sourceCity: string;
+  geometryType: 'Polygon' | 'MultiPolygon';
+  coordinates: PolygonCoordinates | MultiPolygonCoordinates;
+  bbox: [number, number, number, number];
+};
+
 function formatInIsraelTimezone(date: Date) {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Asia/Jerusalem',
@@ -127,6 +138,130 @@ function isValidWebhookUrl(value: string) {
   }
 }
 
+function normalizeCityName(value: string) {
+  return value
+    .normalize('NFKC')
+    .replace(/[\u0591-\u05C7]/g, '')
+    .replace(/['"`׳³׳´]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cityBaseName(value: string) {
+  return normalizeCityName(value).split(/\s*-\s*/)[0].trim();
+}
+
+function cityKey(value: string) {
+  return cityBaseName(value) || normalizeCityName(value);
+}
+
+function alertCities(alert: AlertItem) {
+  return Array.isArray(alert.data?.data)
+    ? alert.data.data.filter((city): city is string => typeof city === 'string' && city.trim().length > 0)
+    : [];
+}
+
+const ISRAEL_BOUNDS = {
+  minLon: 34.2,
+  maxLon: 35.95,
+  minLat: 29.45,
+  maxLat: 33.4,
+};
+
+function toMapPoint(lon: number, lat: number, width: number, height: number) {
+  const xRatio = (lon - ISRAEL_BOUNDS.minLon) / (ISRAEL_BOUNDS.maxLon - ISRAEL_BOUNDS.minLon);
+  const yRatio = (lat - ISRAEL_BOUNDS.minLat) / (ISRAEL_BOUNDS.maxLat - ISRAEL_BOUNDS.minLat);
+  const x = Math.max(0, Math.min(width, xRatio * width));
+  const y = Math.max(0, Math.min(height, height - (yRatio * height)));
+  return [x, y] as [number, number];
+}
+
+function polygonToPath(rings: GeoPoint[][], width: number, height: number) {
+  return rings
+    .map((ring) => {
+      const points = ring
+        .map((point) => {
+          const lon = Number(point?.[0]);
+          const lat = Number(point?.[1]);
+          if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+          const [x, y] = toMapPoint(lon, lat, width, height);
+          return `${x.toFixed(2)} ${y.toFixed(2)}`;
+        })
+        .filter((point): point is string => Boolean(point));
+      if (points.length < 3) return '';
+      return `M ${points.join(' L ')} Z`;
+    })
+    .filter(Boolean)
+    .join(' ');
+}
+
+function AlertCitiesMiniMap({
+  cities,
+  polygons,
+}: {
+  cities: string[];
+  polygons: Record<string, CityPolygonItem | null>;
+}) {
+  const width = 210;
+  const height = 170;
+  const palette = ['#0f766e', '#be123c', '#1d4ed8', '#6d28d9', '#b45309', '#1f2937'];
+  const uniqueCities = Array.from(new Set(cities));
+  const cityEntries = uniqueCities.map((city) => ({ city, polygon: polygons[cityKey(city)] || null }));
+  const available = cityEntries.filter((entry) => Boolean(entry.polygon));
+  const missing = cityEntries.filter((entry) => !entry.polygon).map((entry) => entry.city);
+
+  return (
+    <div className="w-full sm:w-[230px] shrink-0 rounded-lg border border-zinc-200 bg-zinc-50 p-2">
+      <div className="text-[11px] text-zinc-500 mb-1">מפת פוליגונים</div>
+      {available.length === 0 ? (
+        <div className="text-xs text-zinc-500">אין פוליגונים זמינים לערים בהתראה</div>
+      ) : (
+        <>
+          <svg
+            className="w-full rounded-md border border-zinc-200 bg-white"
+            viewBox={`0 0 ${width} ${height}`}
+            role="img"
+            aria-label="מפת פוליגונים לפי ערים"
+          >
+            <rect x="0" y="0" width={width} height={height} fill="#f8fafc" />
+            {available.map((entry, index) => {
+              const color = palette[index % palette.length];
+              const polygon = entry.polygon!;
+              const paths = polygon.geometryType === 'Polygon'
+                ? [polygonToPath(polygon.coordinates as PolygonCoordinates, width, height)]
+                : (polygon.coordinates as MultiPolygonCoordinates).map((part) => polygonToPath(part, width, height));
+              return paths.map((pathD, partIndex) => (
+                <path
+                  key={`${entry.city}-${partIndex}`}
+                  d={pathD}
+                  fill={color}
+                  fillOpacity={0.32}
+                  stroke={color}
+                  strokeWidth={1.1}
+                />
+              ));
+            })}
+          </svg>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {available.map((entry, index) => (
+              <span
+                key={entry.city}
+                className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-white px-2 py-0.5 text-[11px] text-zinc-700"
+              >
+                <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: palette[index % palette.length] }} />
+                {entry.city}
+              </span>
+            ))}
+          </div>
+          {missing.length > 0 && (
+            <div className="mt-2 text-[11px] text-zinc-500">ללא פוליגון: {missing.join(', ')}</div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
@@ -146,6 +281,7 @@ export default function App() {
   const [selectedCityAlertsHasMore, setSelectedCityAlertsHasMore] = useState(false);
   const [selectedCityAlertsLoading, setSelectedCityAlertsLoading] = useState(false);
   const [selectedCityAlertsLoadingMore, setSelectedCityAlertsLoadingMore] = useState(false);
+  const [cityPolygons, setCityPolygons] = useState<Record<string, CityPolygonItem | null>>({});
 
   const [cities, setCities] = useState<string[]>([]);
   const [webhookUrl, setWebhookUrl] = useState('');
@@ -159,6 +295,7 @@ export default function App() {
   const [testFeedback, setTestFeedback] = useState<{ type: FeedbackType; text: string } | null>(null);
 
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const polygonsInFlightRef = useRef<Set<string>>(new Set());
 
   const webhookUrlError = useMemo(() => {
     if (!webhookUrl.trim()) return null;
@@ -277,6 +414,53 @@ export default function App() {
     }
   }, []);
 
+  const ensureCityPolygons = useCallback(async (citiesToEnsure: string[]) => {
+    const uniqueCities = Array.from(new Set(
+      citiesToEnsure
+        .map((city) => city.trim())
+        .filter(Boolean)
+    ));
+    if (uniqueCities.length === 0) return;
+
+    const missing = uniqueCities.filter((city) => {
+      const key = cityKey(city);
+      return key && cityPolygons[key] === undefined && !polygonsInFlightRef.current.has(key);
+    });
+    if (missing.length === 0) return;
+
+    const queryCities = missing.slice(0, 25);
+    const keys = queryCities.map((city) => cityKey(city));
+    keys.forEach((key) => {
+      if (key) polygonsInFlightRef.current.add(key);
+    });
+
+    try {
+      const params = new URLSearchParams();
+      params.set('cities', queryCities.join(','));
+      const res = await fetch(`/api/cities/polygons?${params.toString()}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const items: CityPolygonItem[] = Array.isArray(data?.items) ? data.items : [];
+      const itemMap = new Map(items.map((item) => [cityKey(item.city || item.sourceCity), item]));
+
+      setCityPolygons((prev) => {
+        const next = { ...prev };
+        for (const city of queryCities) {
+          const key = cityKey(city);
+          if (!key || next[key] !== undefined) continue;
+          next[key] = itemMap.get(key) ?? null;
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error('Failed to fetch city polygons', err);
+    } finally {
+      keys.forEach((key) => {
+        if (key) polygonsInFlightRef.current.delete(key);
+      });
+    }
+  }, [cityPolygons]);
+
   useEffect(() => {
     document.title = 'התרעות פיקוד העורף בוט';
     const iconEl = document.querySelector("link[rel='icon']") as HTMLLinkElement | null;
@@ -374,6 +558,18 @@ export default function App() {
     observer.observe(node);
     return () => observer.disconnect();
   }, [activeTab, alertsCursor, alertsHasMore, alertsLoadingInitial, alertsLoadingMore, fetchAlertsPage]);
+
+  useEffect(() => {
+    const currentAlerts = alerts.slice(0, 60);
+    const citiesInAlerts = currentAlerts.flatMap((alert) => alertCities(alert));
+    void ensureCityPolygons(citiesInAlerts);
+  }, [alerts, ensureCityPolygons]);
+
+  useEffect(() => {
+    if (!selectedSummaryCity || selectedCityAlerts.length === 0) return;
+    const citiesInSelectedAlerts = selectedCityAlerts.flatMap((alert) => alertCities(alert));
+    void ensureCityPolygons(citiesInSelectedAlerts);
+  }, [selectedCityAlerts, selectedSummaryCity, ensureCityPolygons]);
 
   const saveSettings = async () => {
     setSaveFeedback(null);
@@ -587,7 +783,7 @@ export default function App() {
               <div className="grid gap-4">
                 {alerts.map((alert, i) => (
                   <div key={`${alert.alert_id || alert.id || i}`} className="bg-white p-5 rounded-xl border border-zinc-200 shadow-sm flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
-                    <div>
+                    <div className="w-full">
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${
                           alert.data?.cat === '10' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
@@ -599,6 +795,7 @@ export default function App() {
                       <p className="font-medium text-lg mt-2">{(alert.data?.data || []).join(', ')}</p>
                       <p className="text-zinc-600 text-sm mt-1">{alert.data?.desc}</p>
                     </div>
+                    <AlertCitiesMiniMap cities={alertCities(alert)} polygons={cityPolygons} />
                   </div>
                 ))}
                 <div ref={loadMoreRef} className="h-8" />
@@ -704,17 +901,20 @@ export default function App() {
                     ) : (
                       <div className="space-y-2">
                         {selectedCityAlerts.map((alert, i) => (
-                          <div key={`${alert.alert_id || alert.id || i}`} className="border border-zinc-200 rounded-lg p-3 bg-zinc-50">
-                            <div className="flex items-center gap-2 text-xs mb-1 flex-wrap">
-                              <span className={`px-2 py-0.5 rounded-full ${
-                                alert.data?.cat === '10' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
-                              }`}>
-                                {alert.data?.title || alert.data?.categoryName || 'התרעה'}
-                              </span>
-                              <span className="text-zinc-500">{formatAlertTimestamp(alert.timestamp)}</span>
+                          <div key={`${alert.alert_id || alert.id || i}`} className="border border-zinc-200 rounded-lg p-3 bg-zinc-50 flex flex-col sm:flex-row gap-3 justify-between items-start">
+                            <div className="w-full">
+                              <div className="flex items-center gap-2 text-xs mb-1 flex-wrap">
+                                <span className={`px-2 py-0.5 rounded-full ${
+                                  alert.data?.cat === '10' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                                }`}>
+                                  {alert.data?.title || alert.data?.categoryName || 'התרעה'}
+                                </span>
+                                <span className="text-zinc-500">{formatAlertTimestamp(alert.timestamp)}</span>
+                              </div>
+                              <div className="text-sm font-medium">{(alert.data?.data || []).join(', ')}</div>
+                              <div className="text-xs text-zinc-600 mt-1">{alert.data?.desc}</div>
                             </div>
-                            <div className="text-sm font-medium">{(alert.data?.data || []).join(', ')}</div>
-                            <div className="text-xs text-zinc-600 mt-1">{alert.data?.desc}</div>
+                            <AlertCitiesMiniMap cities={alertCities(alert)} polygons={cityPolygons} />
                           </div>
                         ))}
                       </div>

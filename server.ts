@@ -27,6 +27,17 @@ const cityLastWebhookAt = new Map<string, {
   lastType: 'THREAT' | 'ALL_CLEAR';
   lastCategory: string;
 }>();
+type GeoPoint = [number, number];
+type PolygonCoordinates = GeoPoint[][];
+type MultiPolygonCoordinates = GeoPoint[][][];
+type CityPolygonItem = {
+  city: string;
+  sourceCity: string;
+  geometryType: 'Polygon' | 'MultiPolygon';
+  coordinates: PolygonCoordinates | MultiPolygonCoordinates;
+  bbox: [number, number, number, number];
+};
+const cityPolygonCache = new Map<string, CityPolygonItem | null>();
 
 app.use(express.json());
 
@@ -419,6 +430,43 @@ app.get('/api/cities', async (req, res) => {
   }
 });
 
+app.get('/api/cities/polygons', async (req, res) => {
+  const rawCities = String(req.query.cities || '');
+  const requestedCities = rawCities
+    .split(',')
+    .map((c) => c.trim())
+    .filter(Boolean)
+    .slice(0, 30);
+
+  if (requestedCities.length === 0) {
+    res.json({ items: [] });
+    return;
+  }
+
+  const uniqueCityEntries = Array.from(new Map(
+    requestedCities.map((city) => [cooldownCityKey(city), city])
+  ).entries());
+
+  const items: CityPolygonItem[] = [];
+  for (const [cityKey, requestedCity] of uniqueCityEntries) {
+    if (!cityKey) continue;
+    let polygon = cityPolygonCache.get(cityKey);
+    if (polygon === undefined) {
+      polygon = await fetchCityPolygonFromNominatim(requestedCity);
+      cityPolygonCache.set(cityKey, polygon ?? null);
+    }
+
+    if (polygon) {
+      items.push({
+        ...polygon,
+        city: requestedCity
+      });
+    }
+  }
+
+  res.json({ items });
+});
+
 // Polling Pikud HaOref
 let lastAlertId = '';
 
@@ -494,6 +542,78 @@ function normalizeCityName(value: string) {
     .replace(/['"`׳״]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function getGeometryBbox(coords: PolygonCoordinates | MultiPolygonCoordinates, type: 'Polygon' | 'MultiPolygon') {
+  let minLon = Number.POSITIVE_INFINITY;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLon = Number.NEGATIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+
+  const rings = type === 'Polygon'
+    ? coords as PolygonCoordinates
+    : (coords as MultiPolygonCoordinates).flat();
+
+  for (const ring of rings) {
+    for (const point of ring) {
+      const lon = Number(point?.[0]);
+      const lat = Number(point?.[1]);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+      minLon = Math.min(minLon, lon);
+      minLat = Math.min(minLat, lat);
+      maxLon = Math.max(maxLon, lon);
+      maxLat = Math.max(maxLat, lat);
+    }
+  }
+
+  if (!Number.isFinite(minLon) || !Number.isFinite(minLat) || !Number.isFinite(maxLon) || !Number.isFinite(maxLat)) {
+    return null;
+  }
+  return [minLon, minLat, maxLon, maxLat] as [number, number, number, number];
+}
+
+async function fetchCityPolygonFromNominatim(city: string): Promise<CityPolygonItem | null> {
+  const queryCity = cityBaseName(city) || city;
+  if (!queryCity) return null;
+
+  try {
+    const params = new URLSearchParams({
+      city: queryCity,
+      country: 'Israel',
+      format: 'geojson',
+      polygon_geojson: '1',
+      limit: '1',
+      'accept-language': 'he'
+    });
+    const response = await fetch(`https://nominatim.openstreetmap.org/search?${params.toString()}`, {
+      headers: {
+        'User-Agent': 'oref-alerts/1.0 (city-polygon-fetch)',
+        'Accept': 'application/geo+json,application/json'
+      }
+    });
+
+    if (!response.ok) return null;
+    const payload = await response.json() as any;
+    const feature = Array.isArray(payload?.features) ? payload.features[0] : null;
+    if (!feature?.geometry?.type || !feature?.geometry?.coordinates) return null;
+
+    const geometryType = feature.geometry.type as string;
+    if (geometryType !== 'Polygon' && geometryType !== 'MultiPolygon') return null;
+    const coordinates = feature.geometry.coordinates as PolygonCoordinates | MultiPolygonCoordinates;
+    const bbox = getGeometryBbox(coordinates, geometryType);
+    if (!bbox) return null;
+
+    return {
+      city: queryCity,
+      sourceCity: queryCity,
+      geometryType,
+      coordinates,
+      bbox
+    };
+  } catch (error) {
+    console.error('Failed to fetch city polygon:', city, error);
+    return null;
+  }
 }
 
 function cityBaseName(value: string) {
