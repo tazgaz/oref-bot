@@ -16,6 +16,8 @@ import {
   Wifi,
   WifiOff,
 } from 'lucide-react';
+import { MapContainer, Polygon, TileLayer } from 'react-leaflet';
+import type { LatLngExpression } from 'leaflet';
 import { ISRAEL_CITIES } from './constants/cities';
 
 const socket = io();
@@ -142,7 +144,7 @@ function normalizeCityName(value: string) {
   return value
     .normalize('NFKC')
     .replace(/[\u0591-\u05C7]/g, '')
-    .replace(/['"`׳³׳´]/g, '')
+    .replace(/['"`]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -161,40 +163,6 @@ function alertCities(alert: AlertItem) {
     : [];
 }
 
-const ISRAEL_BOUNDS = {
-  minLon: 34.2,
-  maxLon: 35.95,
-  minLat: 29.45,
-  maxLat: 33.4,
-};
-
-function toMapPoint(lon: number, lat: number, width: number, height: number) {
-  const xRatio = (lon - ISRAEL_BOUNDS.minLon) / (ISRAEL_BOUNDS.maxLon - ISRAEL_BOUNDS.minLon);
-  const yRatio = (lat - ISRAEL_BOUNDS.minLat) / (ISRAEL_BOUNDS.maxLat - ISRAEL_BOUNDS.minLat);
-  const x = Math.max(0, Math.min(width, xRatio * width));
-  const y = Math.max(0, Math.min(height, height - (yRatio * height)));
-  return [x, y] as [number, number];
-}
-
-function polygonToPath(rings: GeoPoint[][], width: number, height: number) {
-  return rings
-    .map((ring) => {
-      const points = ring
-        .map((point) => {
-          const lon = Number(point?.[0]);
-          const lat = Number(point?.[1]);
-          if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
-          const [x, y] = toMapPoint(lon, lat, width, height);
-          return `${x.toFixed(2)} ${y.toFixed(2)}`;
-        })
-        .filter((point): point is string => Boolean(point));
-      if (points.length < 3) return '';
-      return `M ${points.join(' L ')} Z`;
-    })
-    .filter(Boolean)
-    .join(' ');
-}
-
 function AlertCitiesMiniMap({
   cities,
   polygons,
@@ -202,65 +170,86 @@ function AlertCitiesMiniMap({
   cities: string[];
   polygons: Record<string, CityPolygonItem | null>;
 }) {
-  const width = 210;
-  const height = 170;
   const palette = ['#0f766e', '#be123c', '#1d4ed8', '#6d28d9', '#b45309', '#1f2937'];
   const uniqueCities = Array.from(new Set(cities));
   const cityEntries = uniqueCities.map((city) => ({ city, polygon: polygons[cityKey(city)] || null }));
   const available = cityEntries.filter((entry) => Boolean(entry.polygon));
   const missing = cityEntries.filter((entry) => !entry.polygon).map((entry) => entry.city);
+  if (available.length === 0) return null;
+
+  const polygonLayers = available.flatMap((entry, index) => {
+    const color = palette[index % palette.length];
+    const polygon = entry.polygon!;
+    if (polygon.geometryType === 'Polygon') {
+      const rings = (polygon.coordinates as PolygonCoordinates)
+        .map((ring) => ring
+          .map((point) => [Number(point?.[1]), Number(point?.[0])] as LatLngExpression)
+          .filter((point) => Number.isFinite(Number((point as number[])[0])) && Number.isFinite(Number((point as number[])[1]))));
+      return [{ key: `${entry.city}-0`, color, positions: rings }];
+    }
+
+    return (polygon.coordinates as MultiPolygonCoordinates).map((part, partIndex) => {
+      const rings = part
+        .map((ring) => ring
+          .map((point) => [Number(point?.[1]), Number(point?.[0])] as LatLngExpression)
+          .filter((point) => Number.isFinite(Number((point as number[])[0])) && Number.isFinite(Number((point as number[])[1]))));
+      return { key: `${entry.city}-${partIndex}`, color, positions: rings };
+    });
+  }).filter((layer) => layer.positions.some((ring) => ring.length >= 3));
+
+  const validBboxes = available.map((entry) => entry.polygon!.bbox).filter((bbox) => Array.isArray(bbox) && bbox.length === 4);
+  const mapBounds = validBboxes.length > 0
+    ? [
+      [Math.min(...validBboxes.map((bbox) => bbox[1])), Math.min(...validBboxes.map((bbox) => bbox[0]))],
+      [Math.max(...validBboxes.map((bbox) => bbox[3])), Math.max(...validBboxes.map((bbox) => bbox[2]))],
+    ] as [[number, number], [number, number]]
+    : null;
+  const mapCenter: [number, number] = mapBounds
+    ? [(mapBounds[0][0] + mapBounds[1][0]) / 2, (mapBounds[0][1] + mapBounds[1][1]) / 2]
+    : [31.5, 34.8];
 
   return (
     <div className="w-full sm:w-[230px] shrink-0 rounded-lg border border-zinc-200 bg-zinc-50 p-2">
-      <div className="text-[11px] text-zinc-500 mb-1">מפת פוליגונים</div>
-      {available.length === 0 ? (
-        <div className="text-xs text-zinc-500">אין פוליגונים זמינים לערים בהתראה</div>
-      ) : (
-        <>
-          <svg
-            className="w-full rounded-md border border-zinc-200 bg-white"
-            viewBox={`0 0 ${width} ${height}`}
-            role="img"
-            aria-label="מפת פוליגונים לפי ערים"
+      <div className="text-[11px] text-zinc-500 mb-1">OpenStreetMap</div>
+      <div className="overflow-hidden rounded-md border border-zinc-200">
+        <MapContainer
+          center={mapCenter}
+          zoom={9}
+          bounds={mapBounds ?? undefined}
+          scrollWheelZoom={false}
+          style={{ height: 180, width: '100%' }}
+        >
+          <TileLayer
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            attribution="&copy; OpenStreetMap contributors"
+          />
+          {polygonLayers.map((layer) => (
+            <Polygon
+              key={layer.key}
+              positions={layer.positions}
+              pathOptions={{ color: layer.color, fillColor: layer.color, fillOpacity: 0.28, weight: 2 }}
+            />
+          ))}
+        </MapContainer>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {available.map((entry, index) => (
+          <span
+            key={entry.city}
+            className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-white px-2 py-0.5 text-[11px] text-zinc-700"
           >
-            <rect x="0" y="0" width={width} height={height} fill="#f8fafc" />
-            {available.map((entry, index) => {
-              const color = palette[index % palette.length];
-              const polygon = entry.polygon!;
-              const paths = polygon.geometryType === 'Polygon'
-                ? [polygonToPath(polygon.coordinates as PolygonCoordinates, width, height)]
-                : (polygon.coordinates as MultiPolygonCoordinates).map((part) => polygonToPath(part, width, height));
-              return paths.map((pathD, partIndex) => (
-                <path
-                  key={`${entry.city}-${partIndex}`}
-                  d={pathD}
-                  fill={color}
-                  fillOpacity={0.32}
-                  stroke={color}
-                  strokeWidth={1.1}
-                />
-              ));
-            })}
-          </svg>
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {available.map((entry, index) => (
-              <span
-                key={entry.city}
-                className="inline-flex items-center gap-1 rounded-full border border-zinc-200 bg-white px-2 py-0.5 text-[11px] text-zinc-700"
-              >
-                <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: palette[index % palette.length] }} />
-                {entry.city}
-              </span>
-            ))}
-          </div>
-          {missing.length > 0 && (
-            <div className="mt-2 text-[11px] text-zinc-500">ללא פוליגון: {missing.join(', ')}</div>
-          )}
-        </>
+            <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: palette[index % palette.length] }} />
+            {entry.city}
+          </span>
+        ))}
+      </div>
+      {missing.length > 0 && (
+        <div className="mt-2 text-[11px] text-zinc-500">No polygon for: {missing.join(', ')}</div>
       )}
     </div>
   );
 }
+
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
