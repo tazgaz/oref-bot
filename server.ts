@@ -452,7 +452,7 @@ app.get('/api/cities/polygons', async (req, res) => {
     if (!cityKey) continue;
     let polygon = cityPolygonCache.get(cityKey);
     if (polygon === undefined) {
-      polygon = await fetchCityPolygonFromNominatim(requestedCity);
+      polygon = await fetchCityPolygonFromOsm(requestedCity);
       cityPolygonCache.set(cityKey, polygon ?? null);
     }
 
@@ -486,11 +486,21 @@ async function pollAlerts() {
     lastPollError = response.ok ? null : `HTTP ${response.status}`;
 
     if (response.status === 200) {
-      const text = await response.text();
-      // Pikud HaOref returns empty string if no active alerts
-      if (text.trim() !== '') {
-        const data = JSON.parse(text);
-        if (data.id !== lastAlertId) {
+      const rawText = await response.text();
+      // Oref occasionally returns empty or malformed payloads (for example NUL bytes).
+      const cleanedText = rawText.replace(/\u0000/g, '').trim();
+      if (cleanedText !== '') {
+        let data: any = null;
+        try {
+          data = JSON.parse(cleanedText);
+        } catch {
+          lastPollOk = false;
+          lastPollError = 'Malformed JSON from Oref alerts endpoint';
+          setTimeout(pollAlerts, 2000);
+          return;
+        }
+
+        if (data?.id && data.id !== lastAlertId) {
           lastAlertId = data.id;
           handleAlerts(data);
         }
@@ -572,41 +582,66 @@ function getGeometryBbox(coords: PolygonCoordinates | MultiPolygonCoordinates, t
   return [minLon, minLat, maxLon, maxLat] as [number, number, number, number];
 }
 
-async function fetchCityPolygonFromNominatim(city: string): Promise<CityPolygonItem | null> {
+async function fetchCityPolygonFromOsm(city: string): Promise<CityPolygonItem | null> {
   const queryCity = cityBaseName(city) || city;
   if (!queryCity) return null;
 
   try {
-    const params = new URLSearchParams({
-      city: queryCity,
-      country: 'Israel',
-      format: 'geojson',
-      polygon_geojson: '1',
-      limit: '1',
-      'accept-language': 'he'
-    });
-    const response = await fetch(`https://nominatim.openstreetmap.org/search?${params.toString()}`, {
+    const escapedCity = queryCity.replace(/["\\]/g, '');
+    const query = `
+[out:json][timeout:25];
+area["name:he"="ישראל"]["admin_level"="2"]->.a;
+(
+  relation["boundary"="administrative"]["admin_level"~"7|8"]["name"="${escapedCity}"](area.a);
+  way["boundary"="administrative"]["admin_level"~"7|8"]["name"="${escapedCity}"](area.a);
+);
+out geom;
+`.trim();
+
+    const response = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
       headers: {
-        'User-Agent': 'oref-alerts/1.0 (city-polygon-fetch)',
-        'Accept': 'application/geo+json,application/json'
-      }
+        'User-Agent': 'oref-alerts/1.0 (city-polygon-fetch-overpass)',
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: `data=${encodeURIComponent(query)}`
     });
 
     if (!response.ok) return null;
     const payload = await response.json() as any;
-    const feature = Array.isArray(payload?.features) ? payload.features[0] : null;
-    if (!feature?.geometry?.type || !feature?.geometry?.coordinates) return null;
+    const elements = Array.isArray(payload?.elements) ? payload.elements : [];
 
-    const geometryType = feature.geometry.type as string;
-    if (geometryType !== 'Polygon' && geometryType !== 'MultiPolygon') return null;
-    const coordinates = feature.geometry.coordinates as PolygonCoordinates | MultiPolygonCoordinates;
-    const bbox = getGeometryBbox(coordinates, geometryType);
+    const rings: GeoPoint[][] = [];
+    for (const element of elements) {
+      if (element?.type === 'relation' && Array.isArray(element?.members)) {
+        for (const member of element.members) {
+          if (member?.role === 'inner') continue;
+          if (!Array.isArray(member?.geometry)) continue;
+          const ring = member.geometry
+            .map((point: any) => [Number(point?.lon), Number(point?.lat)] as GeoPoint)
+            .filter((point: GeoPoint) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+          if (ring.length >= 3) rings.push(ring);
+        }
+      }
+
+      if (element?.type === 'way' && Array.isArray(element?.geometry)) {
+        const ring = element.geometry
+          .map((point: any) => [Number(point?.lon), Number(point?.lat)] as GeoPoint)
+          .filter((point: GeoPoint) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+        if (ring.length >= 3) rings.push(ring);
+      }
+    }
+
+    if (rings.length === 0) return null;
+
+    const coordinates = rings as PolygonCoordinates;
+    const bbox = getGeometryBbox(coordinates, 'Polygon');
     if (!bbox) return null;
 
     return {
       city: queryCity,
       sourceCity: queryCity,
-      geometryType,
+      geometryType: 'Polygon',
       coordinates,
       bbox
     };
