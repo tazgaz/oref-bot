@@ -590,10 +590,12 @@ async function fetchCityPolygonFromOsm(city: string): Promise<CityPolygonItem | 
     const escapedCity = queryCity.replace(/["\\]/g, '');
     const query = `
 [out:json][timeout:25];
-area["name:he"="ישראל"]["admin_level"="2"]->.a;
+area["ISO3166-1"="IL"]["admin_level"="2"]->.a;
 (
   relation["boundary"="administrative"]["admin_level"~"7|8"]["name"="${escapedCity}"](area.a);
+  relation["boundary"="administrative"]["admin_level"~"7|8"]["name:he"="${escapedCity}"](area.a);
   way["boundary"="administrative"]["admin_level"~"7|8"]["name"="${escapedCity}"](area.a);
+  way["boundary"="administrative"]["admin_level"~"7|8"]["name:he"="${escapedCity}"](area.a);
 );
 out geom;
 `.trim();
